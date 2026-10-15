@@ -1,9 +1,11 @@
-"""抖音网页版（im.douyin.com）浏览器自动化。
+"""抖音网页版（主站消息中心）浏览器自动化。
 
 设计原则：
 - 登录只用"手机扫码"，登录态存在 browser_data 持久化目录，一次登录长期复用；
 - 是否已登录用 cookie（sessionid / sessionid_ss）判断，不依赖页面 DOM，最可靠；
-- 发消息走真实浏览器 + 发送后强校验（输入框清空 且 消息气泡出现），失败截图存档；
+- 发消息走真实浏览器 + 强校验（会话点开输入框出现 + 发送后消息气泡出现），失败自动重试；
+- 会话定位用官方 data-e2e 锚点（im-entry / im-dialog / conversation-item），
+  搜索兜底只允许侧栏内部搜索框，绝不触碰主站顶部搜索框；
 - user_data_dir 同一时刻只能被一个浏览器实例占用，全部会话经 _BROWSER_LOCK 串行化。
 """
 import random
@@ -29,18 +31,23 @@ WIN_ONSCREEN = (80, 40, 1200, 820)
 WIN_OFFSCREEN = (2000, 2000, 1280, 900)
 
 # ---- selector 候选链（按顺序尝试；页面改版时优先改这里）----
+# 2026-10 实测：消息侧栏有官方 data-e2e 锚点：im-entry / im-dialog / conversation-item
 # 消息中心入口（主站右上角）
 MSG_ENTRY_SELECTORS = [
+    "[data-e2e='im-entry']",
     "[data-e2e='message-entry']",
-    "[data-e2e='navbar-message']",
     "div[aria-label*='消息']",
     "[class*='message'][class*='entry']",
 ]
-# 会话搜索框
-SEARCH_SELECTORS = [
-    "input[placeholder*='搜索']",
-    "input[type='search']",
-    "div[data-e2e='search-input'] input",
+# 消息侧栏容器（侧栏打开的标志）
+IM_DIALOG = "[data-e2e='im-dialog']"
+# 会话列表项（首行文本 = 昵称）
+CONVERSATION_ITEM = "[data-e2e='conversation-item']"
+# 侧栏内部的搜索框（绝不能用主站顶部搜索框 data-e2e='searchbar-input'！）
+SIDEBAR_SEARCH_SELECTORS = [
+    "[data-e2e='im-dialog'] input[placeholder*='搜索']",
+    "input[class*='im-saas-input']",
+    "[class*='searchSearchInput'] input",
 ]
 INPUT_SELECTORS = [
     "div[contenteditable='true']",
@@ -275,39 +282,137 @@ def _first_visible(page, selectors, timeout=3000):
     return None
 
 
-def _find_and_open_conversation(page, name):
-    """打开与 name 的会话：优先会话列表精确匹配，失败走搜索。"""
-    # 路径 1：会话列表中点击昵称
+def _match_conversation_item(page, name):
+    """在当前 DOM 的会话列表里找首行昵称等于 name 的会话项（单轮扫描，不等待）。"""
     try:
-        cand = page.get_by_text(name, exact=True)
-        n = cand.count()
-        for i in range(min(n, 5)):
-            item = cand.nth(i)
+        items = page.locator(CONVERSATION_ITEM)
+        n = items.count()
+        candidates = []
+        for i in range(n):
+            it = items.nth(i)
             try:
-                if item.is_visible():
-                    item.click()
-                    page.wait_for_timeout(1500)
-                    return "list"
+                if not it.is_visible(timeout=500):
+                    continue
+                txt = (it.inner_text(timeout=800) or "").strip()
             except Exception:
                 continue
+            if not txt:
+                continue
+            first_line = txt.split("\n")[0].strip()
+            if first_line == name:
+                return it          # 精确匹配，最优
+            if txt.startswith(name):
+                candidates.append(it)  # 容忍昵称后无换行的变体
+        return candidates[0] if candidates else None
+    except Exception:
+        return None
+
+
+def _wait_conversation_item(page, name, timeout_s=10):
+    """等待目标会话项出现；期间把鼠标悬到侧栏上小幅滚动（目标会话可能排在列表底部）。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        it = _match_conversation_item(page, name)
+        if it is not None:
+            return it
+        try:
+            dlg = page.locator(IM_DIALOG).first
+            if dlg.is_visible(timeout=500):
+                dlg.hover(timeout=800)
+            page.mouse.wheel(0, 240)
+        except Exception:
+            pass
+        page.wait_for_timeout(600)
+    return None
+
+
+def _wait_chat_input(page, timeout_ms=8000):
+    """等待聊天窗输入框出现（会话真正打开的标志）。"""
+    try:
+        page.wait_for_selector("div[contenteditable='true']", timeout=timeout_ms,
+                               state="visible")
+        loc = page.locator("div[contenteditable='true']").first
+        if loc.is_visible(timeout=800):
+            return loc
     except Exception:
         pass
-    # 路径 2：搜索
-    search = _first_visible(page, SEARCH_SELECTORS)
-    if search is not None:
+    return _first_visible(page, INPUT_SELECTORS, timeout=1500)
+
+
+def _chat_view_hint(page):
+    """抓聊天视图文本片段（如对方隐私限制提示），用于失败原因可读化。"""
+    try:
+        dlg = page.locator(IM_DIALOG).first
+        if dlg.is_visible(timeout=500):
+            t = (dlg.inner_text(timeout=800) or "").strip()
+            if t:
+                return t[:100].replace("\n", " ")
+    except Exception:
+        pass
+    return ""
+
+
+def _open_via_sidebar_search(page, name):
+    """在消息侧栏内部搜索并点开会话（绝不碰主站顶部搜索框）。
+    成功打开聊天窗返回 True。"""
+    search = _first_visible(page, SIDEBAR_SEARCH_SELECTORS, timeout=2000)
+    if search is None:
+        _log("sidebar search: no search box found")
+        return False
+    try:
         search.click()
         search.fill(name)
         page.keyboard.press("Enter")
-        page.wait_for_timeout(2000)
-        res = page.get_by_text(name, exact=False).first
+        page.wait_for_timeout(2200)
+        # 结果优先按会话项匹配
+        item = _match_conversation_item(page, name)
+        if item is not None:
+            item.click()
+            page.wait_for_timeout(1200)
+            if _wait_chat_input(page, 6000) is not None:
+                return True
+        # 侧栏内文本兜底（搜索结果/联系人卡片）
         try:
-            if res.is_visible():
-                res.click()
-                page.wait_for_timeout(1500)
-                return "search"
+            dialog = page.locator(IM_DIALOG).first
+            cand = dialog.get_by_text(name, exact=True)
+            for i in range(min(cand.count(), 5)):
+                el = cand.nth(i)
+                try:
+                    if el.is_visible():
+                        el.click()
+                        page.wait_for_timeout(1200)
+                        if _wait_chat_input(page, 6000) is not None:
+                            return True
+                except Exception:
+                    continue
         except Exception:
             pass
-    raise SendFailed("找不到会话入口（会话列表与搜索均未定位到「%s」）" % name)
+    except Exception as e:
+        _log("sidebar search error: %r" % e)
+    return False
+
+
+def _find_and_open_conversation(page, name):
+    """打开与 name 的会话并确认聊天窗已展开（输入框出现）。
+    顺序：会话列表（显式等待+滚动）→ 侧栏内搜索。失败原因带页面提示。"""
+    hint = ""
+    item = _wait_conversation_item(page, name, timeout_s=10)
+    if item is not None:
+        try:
+            item.click()
+            page.wait_for_timeout(1000)
+            if _wait_chat_input(page, 6000) is not None:
+                return "list"
+            hint = _chat_view_hint(page)
+            _log("open conv: clicked item but no chat input; hint=%r" % hint)
+        except Exception:
+            pass
+    if _open_via_sidebar_search(page, name):
+        return "search"
+    msg = "无法打开与「%s」的会话（会话列表与侧栏搜索均未成功）" % name
+    if hint:
+        msg += "；页面提示: %s" % hint
+    raise SendFailed(msg)
 
 
 def _shot(page, tag):
@@ -321,11 +426,11 @@ def _shot(page, tag):
 
 
 def _open_message_center(page):
-    """打开消息中心：先直接访问 /message，打不开则回退主站点「消息」图标。"""
+    """打开消息中心侧栏：先直接访问 /message，侧栏没出现则回退主站点「消息」图标。"""
     page.goto(IM_URL, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(2500)
-    # 判定消息中心是否真的打开：页面上有搜索框或会话/输入特征
-    if _first_visible(page, SEARCH_SELECTORS, timeout=1500) is None:
+    # 判定消息侧栏是否真的打开：im-dialog 容器可见（不能用主站顶部搜索框判定！）
+    if _first_visible(page, [IM_DIALOG], timeout=1500) is None:
         _log("open_message_center: /message fallback -> homepage entry")
         page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(2000)
@@ -497,11 +602,11 @@ def _send_once(name, text):
         if not has_session_cookie(_context):
             raise NotLoggedIn("登录态已失效，请重新扫码")
         _find_and_open_conversation(page, name)
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(500)
 
-        box = _first_visible(page, INPUT_SELECTORS)
+        box = _wait_chat_input(page, 3000)
         if box is None:
-            raise SendFailed("找不到聊天输入框")
+            raise SendFailed("找不到聊天输入框（会话已打开但输入框未渲染）")
         box.click()
         page.wait_for_timeout(300)
 
