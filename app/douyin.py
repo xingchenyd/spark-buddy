@@ -9,6 +9,7 @@
 - user_data_dir 同一时刻只能被一个浏览器实例占用，全部会话经 _BROWSER_LOCK 串行化。
 """
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -354,7 +355,7 @@ def _chat_view_hint(page):
 
 def _open_via_sidebar_search(page, name):
     """在消息侧栏内部搜索并点开会话（绝不碰主站顶部搜索框）。
-    成功打开聊天窗返回 True。"""
+    结果项带「发消息」按钮时点按钮直达聊天；成功打开聊天窗返回 True。"""
     search = _first_visible(page, SIDEBAR_SEARCH_SELECTORS, timeout=2000)
     if search is None:
         _log("sidebar search: no search box found")
@@ -364,6 +365,35 @@ def _open_via_sidebar_search(page, name):
         search.fill(name)
         page.keyboard.press("Enter")
         page.wait_for_timeout(2200)
+        # 结果项（SearchPanelitembox）：昵称 | 火花数 | 发消息
+        dlg = page.locator(IM_DIALOG).first
+        try:
+            btns = dlg.get_by_text("发消息", exact=True)
+            for i in range(min(btns.count(), 5)):
+                btn = btns.nth(i)
+                try:
+                    if not btn.is_visible(timeout=500):
+                        continue
+                    # 确认按钮所在结果项的文本以目标昵称开头
+                    holder = btn
+                    matched = False
+                    for _ in range(4):
+                        holder = holder.locator("xpath=..")
+                        t = (holder.inner_text(timeout=600) or "").strip()
+                        if t.startswith(name):
+                            matched = True
+                            break
+                        if t.length > 60:
+                            break
+                    if matched:
+                        btn.click()
+                        page.wait_for_timeout(1500)
+                        if _wait_chat_input(page, 6000) is not None:
+                            return True
+                except Exception:
+                    continue
+        except Exception as e:
+            _log("sidebar search send-btn error: %r" % e)
         # 结果优先按会话项匹配
         item = _match_conversation_item(page, name)
         if item is not None:
@@ -373,8 +403,7 @@ def _open_via_sidebar_search(page, name):
                 return True
         # 侧栏内文本兜底（搜索结果/联系人卡片）
         try:
-            dialog = page.locator(IM_DIALOG).first
-            cand = dialog.get_by_text(name, exact=True)
+            cand = dlg.get_by_text(name, exact=True)
             for i in range(min(cand.count(), 5)):
                 el = cand.nth(i)
                 try:
@@ -455,7 +484,29 @@ def _open_message_center(page):
                 pass
 
 
-# ---- 联系人提取（会话列表 / 用户搜索）----
+# ---- 联系人提取 ----
+# 会话列表提取：用官方 conversation-item 锚点（2026-10 实测）
+# 会话项文本结构：昵称 / 火花数 / 时间 / 最后一条消息（抖音号在会话列表里不存在）
+SESSIONS_JS = r"""
+() => {
+  const seen = new Map();
+  document.querySelectorAll("[data-e2e='conversation-item']").forEach(item => {
+    try {
+      const img = item.querySelector('img');
+      const lines = (item.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+      if (!lines.length) return;
+      const name = lines[0];
+      if (!name || name.length > 40) return;
+      const avatar = img ? (img.src || '') : '';
+      const preview = lines.slice(1, 4).join(' · ').slice(0, 60);
+      if (!seen.has(name)) seen.set(name, {name: name, uid: '', avatar: avatar, preview: preview});
+    } catch (e) {}
+  });
+  return Array.from(seen.values()).slice(0, 60);
+}
+"""
+
+# 用户搜索页（主站 /search?type=user）卡片提取：卡片文本含「抖音号: xxx」
 CONTACT_JS = r"""
 () => {
   const seen = new Map();
@@ -524,8 +575,20 @@ def _extract_contacts(page):
         return []
 
 
+def _extract_sessions(page):
+    """从消息侧栏提取会话（conversation-item 锚点），失败回退旧 CONTACT_JS。"""
+    try:
+        items = page.evaluate(SESSIONS_JS)
+        if items:
+            return items
+    except Exception as e:
+        _log("extract sessions error: %r" % e)
+    return _extract_contacts(page)
+
+
 def fetch_contacts(max_tries=3):
-    """打开消息中心读取会话列表。返回 (contacts, shot, err)。"""
+    """打开消息中心读取会话列表。返回 (contacts, shot, err)。
+    注意：会话列表里没有抖音号，uid 需要用 enrich_uid 走主站搜索补全。"""
     with _BROWSER_LOCK:
         shot = ""
         try:
@@ -537,7 +600,7 @@ def fetch_contacts(max_tries=3):
             page.wait_for_timeout(1500)
             contacts = []
             for i in range(max_tries):
-                contacts = _extract_contacts(page)
+                contacts = _extract_sessions(page)
                 if contacts:
                     break
                 try:
@@ -592,6 +655,168 @@ def search_users(kw):
             return [], shot, "异常: %r" % e
         finally:
             _close()
+
+
+# 综合搜索页的用户名片（含「抖音号: xxx」；type=user 的卡片反而不显示抖音号）
+SEARCH_UID_JS = r"""
+() => {
+  const out = [];
+  const seen = new Set();
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const t = walker.currentNode.textContent || '';
+    if (!/抖音号[:：]/.test(t)) continue;   // 只要带冒号的（热搜词卡是"xxx抖音号"无冒号，天然排除）
+    let el = walker.currentNode.parentElement, hops = 0, best = null;
+    while (el && hops < 8) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 200 && r.height > 60) { best = el; break; }
+      el = el.parentElement; hops++;
+    }
+    if (!best) continue;
+    const key = (best.className || '').toString() + '|' + (best.innerText || '').slice(0, 60);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const txt = (best.innerText || '').trim();
+    const m = txt.match(/抖音号[:：]\s*([A-Za-z0-9_.\-]+)/);
+    if (m) {
+      const name = (txt.split('\n')[0] || '').replace(/[|\s]+$/, '').trim().slice(0, 40);
+      out.push({name: name, uid: m[1]});
+    }
+  }
+  return out.slice(0, 10);
+}
+"""
+
+
+def _avatar_tokens(url):
+    """从头像 URL 提取全局唯一 ID 片段（同一个人在不同场景的头像 URL 共享同一 ID）。"""
+    return set(re.findall(r"[A-Za-z0-9_-]{16,}", url or ""))
+
+
+def _search_uid_once(page, name, avatar=""):
+    """搜人拿抖音号，两级策略：
+    1) 综合搜索页的用户名片（右侧卡片含「抖音号: xxx」，最快）；
+    2) 用户 tab 精确匹配卡片（昵称精确，或头像 ID 与会话头像一致）→ 点进主页读抖音号。"""
+    # 路径 1：综合页名片
+    try:
+        page.goto("https://www.douyin.com/search/%s" % quote(name),
+                  wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(4000)
+        cards = page.evaluate(SEARCH_UID_JS)
+        for c in cards:
+            if c.get("name") == name and c.get("uid"):
+                return c["uid"]
+    except Exception as e:
+        _log("enrich card path error: %r" % e)
+    # 路径 2：用户 tab → 主页
+    try:
+        page.goto("https://www.douyin.com/search/%s?type=user" % quote(name),
+                  wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3800)
+        contacts = _extract_contacts(page)
+        target_tokens = _avatar_tokens(avatar)
+
+        def pick():
+            for c in contacts:
+                if c.get("name") == name:
+                    return c
+            if target_tokens:   # 昵称带 emoji 等显示差异时，头像 ID 是唯一铁证
+                for c in contacts:
+                    if _avatar_tokens(c.get("avatar")) & target_tokens:
+                        _log("enrich %s: matched by avatar id, card name=%r"
+                             % (name, c.get("name")))
+                        return c
+            return None
+
+        card = pick()
+        if card is None:
+            for _ in range(3):   # 精确卡可能排得很靠后，多滚几轮
+                try:
+                    page.mouse.wheel(0, 900)
+                    page.wait_for_timeout(1400)
+                    contacts = _extract_contacts(page)
+                    card = pick()
+                    if card is not None:
+                        break
+                except Exception:
+                    pass
+        if card is None:
+            _log("enrich %s: no matching user card, candidates=%s"
+                 % (name, [c.get("name") for c in contacts][:5]))
+            return None
+        card_name = card["name"]
+        cand = page.get_by_text(card_name, exact=True)
+        clicked = False
+        for i in range(min(cand.count(), 5)):
+            el = cand.nth(i)
+            try:
+                if el.is_visible(timeout=500):
+                    el.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            _log("enrich %s: card %r not clickable" % (name, card_name))
+            return None
+        page.wait_for_timeout(4000)
+        for p in _context.pages:
+            if "/user/" in p.url:
+                try:
+                    txt = p.inner_text("body", timeout=6000)
+                except Exception:
+                    continue
+                m = re.search(r"抖音号[:：]\s*([A-Za-z0-9_.\-]+)", txt)
+                if m:
+                    return m.group(1)
+                break
+    except Exception as e:
+        _log("enrich profile path error: %r" % e)
+    return None
+
+
+def enrich_uid(items):
+    """搜人补全抖音号。items 可为 [昵称] 或 {昵称: 头像URL}（带头像可提高匹配率）。
+    返回 {name: {"uid": ...}}，搜不到的人不在结果里。"""
+    if isinstance(items, dict):
+        pairs = [(k, v or "") for k, v in items.items() if (k or "").strip()]
+    else:
+        pairs = [(n, "") for n in (items or []) if (n or "").strip()]
+    if not pairs:
+        return {}
+    out = {}
+    with _BROWSER_LOCK:
+        try:
+            page = _open(headless=False)
+            if not has_session_cookie(_context):
+                page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
+                          timeout=30000)
+                page.wait_for_timeout(2000)
+            for i, (name, avatar) in enumerate(pairs):
+                try:
+                    if not has_session_cookie(_context):
+                        _log("enrich: login expired, stop at %d/%d" % (i, len(pairs)))
+                        break
+                    uid = None
+                    for attempt in range(3):
+                        uid = _search_uid_once(page, name, avatar)
+                        if uid:
+                            break
+                        if attempt < 2:
+                            time.sleep(random.uniform(3.0, 5.0))
+                    if uid:
+                        out[name] = {"uid": uid}
+                        _log("enrich %s -> uid=%s" % (name, uid))
+                    else:
+                        _log("enrich %s -> no exact match" % name)
+                except Exception as e:
+                    _log("enrich %s error: %r" % (name, e))
+                time.sleep(random.uniform(2.5, 5.0))
+        except Exception as e:
+            _log("enrich error: %r" % e)
+        finally:
+            _close()
+    return out
 
 
 def _send_once(name, text):

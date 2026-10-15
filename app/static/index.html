@@ -98,9 +98,10 @@
         <div style="margin-bottom:10px">
           <button class="btn small" onclick="openPicker('sessions')">📥 从会话列表导入</button>
           <button class="btn small gray" onclick="openPicker('search')">🔎 搜索添加</button>
+          <button class="btn small gray" onclick="enrichUid()">🆔 补全抖音号</button>
         </div>
         <table>
-          <thead><tr><th>发?</th><th>成员</th><th>单独发送</th><th></th></tr></thead>
+          <thead><tr><th>发送</th><th>成员</th><th>单独发送</th><th></th></tr></thead>
           <tbody id="targets"></tbody>
         </table>
         <div class="hint" id="t-empty" style="display:none">还没有目标：点上方按钮从会话列表或搜索中勾选添加</div>
@@ -108,6 +109,7 @@
           <summary class="muted" style="cursor:pointer">手动添加（兜底）</summary>
           <div class="inline" style="margin-top:6px">
             <input type="text" id="t-name" placeholder="抖音昵称（需与聊天列表显示一致）">
+            <input type="text" id="t-uid" placeholder="抖音号（可选，便于区分重名）">
             <button class="btn small" style="flex:0" onclick="addTarget()">添加</button>
           </div>
         </details>
@@ -234,12 +236,25 @@ function renderTargets() {
 
 function addTarget() {
   const n = document.getElementById('t-name').value.trim();
+  const u = document.getElementById('t-uid').value.trim();
   if (!n) return show('请输入昵称', true);
   CFG.targets = CFG.targets || [];
   if (CFG.targets.some(t => t.name === n)) return show('该昵称已存在', true);
-  CFG.targets.push({ name: n, uid: '', avatar: '', enabled: true });
+  CFG.targets.push({ name: n, uid: u, avatar: '', enabled: true });
   document.getElementById('t-name').value = '';
+  document.getElementById('t-uid').value = '';
   saveConfig().then(() => show('已添加 ' + n + ' 并保存'));
+}
+
+async function enrichUid() {
+  const empty = (CFG.targets || []).filter(t => t.enabled && !t.uid);
+  if (!empty.length) return show('所有已启用的目标都有抖音号了');
+  show('正在为主站搜索补全 ' + empty.length + ' 人的抖音号…（每人约 5 秒，期间会弹出浏览器窗口）');
+  try {
+    const r = await j('/api/contacts/enrich', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    await refreshConfig();
+    show(r.msg || '补全完成');
+  } catch (e) { show('补全失败: ' + e.message, true); }
 }
 
 async function sendOne(i) {

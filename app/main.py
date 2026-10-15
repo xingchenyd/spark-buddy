@@ -174,6 +174,31 @@ def contacts_search(body: dict):
     return {"ok": not err, "contacts": contacts, "shot": shot, "msg": err}
 
 
+@app.post("/api/contacts/enrich")
+def contacts_enrich():
+    """给配置里没有抖音号的目标补全：主站搜索逐人精确匹配（每人约 5 秒）。
+    补全结果（抖音号+头像）写回配置长期保留。"""
+    if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
+        return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/发送中），稍后再试"}, status_code=409)
+    cfg = config.load_config()
+    need = {t["name"]: t.get("avatar", "") for t in cfg.get("targets", [])
+            if t.get("enabled") and not t.get("uid")}
+    if not need:
+        return {"ok": True, "msg": "所有已启用的目标都有抖音号，无需补全", "found": 0, "total": 0}
+    found = douyin.enrich_uid(need)
+    if found:
+        for t in cfg["targets"]:
+            info = found.get(t["name"])
+            if info and info.get("uid"):
+                t["uid"] = info["uid"]
+        config.save_config(cfg)
+    miss = [n for n in need if n not in found]
+    msg = "补全成功 %d/%d 人" % (len(found), len(need))
+    if miss:
+        msg += "；未匹配到： %s（可手动添加抖音号，或昵称与抖音号不一致导致）" % "、".join(miss[:6])
+    return {"ok": True, "msg": msg, "found": len(found), "total": len(need), "miss": miss}
+
+
 @app.post("/api/run-now")
 def run_now():
     if scheduler.task_running:
