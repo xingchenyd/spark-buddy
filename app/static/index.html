@@ -4,175 +4,310 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>火花管家 · SparkBuddy</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔥</text></svg>">
 <style>
   :root {
-    --bg: #0f1117; --card: #171a23; --card2: #1d212e; --line: #2a2f3e;
-    --text: #e8eaf0; --muted: #8b93a7; --acc: #ff6b35; --acc2: #ffd23f;
-    --ok: #4ade80; --err: #f87171; --info: #60a5fa;
+    --bg: #f4f6fb; --card: #ffffff; --line: #e7eaf3; --line2: #eef0f7;
+    --text: #1c2333; --muted: #858da3; --acc: #fe2c55; --acc-h: #e4244d;
+    --acc-soft: #fff0f3; --ok: #16a34a; --ok-soft: #e8f7ee; --err: #e5484d;
+    --err-soft: #fdeced; --warn: #d97706; --warn-soft: #fdf3e2; --info: #2563eb;
+    --info-soft: #eaf1fe; --shadow: 0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.06);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif; padding: 20px; }
-  .wrap { max-width: 1080px; margin: 0 auto; }
-  h1 { font-size: 22px; margin-bottom: 4px; }
-  h1 .flame { color: var(--acc); }
-  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-  .card h2 { font-size: 15px; margin-bottom: 12px; color: var(--acc2); }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
-  .stats { display: flex; gap: 12px; flex-wrap: wrap; }
-  .stat { background: var(--card2); border-radius: 10px; padding: 10px 16px; min-width: 130px; }
-  .stat .k { color: var(--muted); font-size: 12px; }
-  .stat .v { font-size: 18px; font-weight: 600; }
-  .btn { display: inline-block; border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 14px; color: #fff; background: var(--acc); margin: 2px 6px 2px 0; }
-  .btn:hover { filter: brightness(1.1); }
-  .btn.gray { background: #39415a; }
-  .btn.small { padding: 3px 10px; font-size: 12px; }
-  .btn.danger { background: #b3384a; }
-  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #d3d8e6; border-radius: 99px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* ===== 顶栏 ===== */
+  .topbar { position: sticky; top: 0; z-index: 40; background: rgba(255,255,255,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  .topbar-in { max-width: 1180px; margin: 0 auto; padding: 0 24px; height: 62px; display: flex; align-items: center; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-size: 16.5px; font-weight: 700; letter-spacing: .2px; }
+  .brand .logo { width: 34px; height: 34px; border-radius: 10px; background: linear-gradient(135deg, #ff6b6b, #fe2c55); display: flex; align-items: center; justify-content: center; font-size: 18px; box-shadow: 0 3px 8px rgba(254,44,85,.3); }
+  .brand small { font-weight: 500; color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .topbar .grow { flex: 1; }
+  .topbar .acts { display: flex; align-items: center; gap: 10px; }
+
+  /* ===== 布局 ===== */
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 24px 48px; }
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  @media (max-width: 980px) { .kpis { grid-template-columns: repeat(2, 1fr); } .layout { grid-template-columns: 1fr; } }
+
+  /* ===== KPI 卡 ===== */
+  .kpi { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px 12px; box-shadow: var(--shadow); }
+  .kpi .k { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 12.5px; }
+  .kpi .k .ic { width: 26px; height: 26px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 13px; }
+  .kpi .v { font-size: 21px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 8px; min-height: 30px; }
+  .kpi .s { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .kpi .bar { height: 4px; border-radius: 99px; background: var(--line2); margin-top: 9px; overflow: hidden; }
+  .kpi .bar i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, #ff7a59, var(--acc)); width: 0; transition: width .5s ease; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--ok); } .dot.err { background: var(--err); }
+  .dot.warn { background: var(--warn); } .dot.info { background: var(--info); }
+
+  /* ===== 卡片 ===== */
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; box-shadow: var(--shadow); }
+  .card-h { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  .card-h h2 { font-size: 15px; font-weight: 600; }
+  .card-h .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  /* ===== 按钮 ===== */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid transparent; border-radius: 9px; padding: 8px 14px; cursor: pointer; font-size: 13.5px; font-weight: 500; color: #fff; background: var(--acc); transition: background .15s, border-color .15s, color .15s; white-space: nowrap; font-family: inherit; }
+  .btn:hover { background: var(--acc-h); }
+  .btn.subtle { background: #fff; color: var(--text); border-color: #d9deeb; }
+  .btn.subtle:hover { background: #f7f8fc; border-color: #c4cbdd; }
+  .btn.danger { background: #fff; color: var(--err); border-color: #f2c8ca; }
+  .btn.danger:hover { background: var(--err-soft); }
+  .btn.small { padding: 5px 11px; font-size: 12.5px; border-radius: 8px; }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--err); padding: 5px 8px; }
+  .btn.ghost:hover { background: var(--err-soft); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+
+  /* ===== 表单 ===== */
   input[type=text], input[type=time], input[type=number], textarea {
-    background: var(--card2); border: 1px solid var(--line); color: var(--text);
-    border-radius: 8px; padding: 7px 10px; font-size: 14px; width: 100%;
+    background: #fbfcfe; border: 1px solid #dde2ee; color: var(--text);
+    border-radius: 9px; padding: 8px 11px; font-size: 13.5px; width: 100%; font-family: inherit; transition: border-color .15s, box-shadow .15s;
   }
-  textarea { resize: vertical; min-height: 90px; font-family: inherit; }
-  label.row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
-  label.row .lbl { min-width: 100px; color: var(--muted); }
+  input:focus, textarea:focus { outline: none; border-color: #f7a6b8; box-shadow: 0 0 0 3px rgba(254,44,85,.1); }
+  textarea { resize: vertical; min-height: 74px; line-height: 1.55; }
+  .frow { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+  .frow .lbl { width: 92px; flex: none; color: var(--muted); font-size: 13px; }
+  .frow .val { flex: 1; display: flex; align-items: center; gap: 8px; }
+  .frow .val .tilde { color: var(--muted); }
+  .frow .val input[type=number] { width: 76px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.55; }
+  .sep { border: 0; border-top: 1px solid var(--line2); margin: 10px 0; }
+
+  /* 开关 */
+  .switch { position: relative; display: inline-block; width: 38px; height: 21px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch i { position: absolute; inset: 0; border-radius: 99px; background: #d5dae7; transition: .18s; cursor: pointer; }
+  .switch i::before { content: ""; position: absolute; width: 15px; height: 15px; border-radius: 50%; background: #fff; top: 3px; left: 3px; transition: .18s; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+  .switch input:checked + i { background: var(--acc); }
+  .switch input:checked + i::before { transform: translateX(17px); }
+
+  /* ===== 表格 ===== */
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: normal; }
-  .pill { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 12px; }
-  .pill.ok { background: rgba(74,222,128,.15); color: var(--ok); }
-  .pill.err { background: rgba(248,113,113,.15); color: var(--err); }
-  .pill.warn { background: rgba(255,210,63,.15); color: var(--acc2); }
-  .pill.info { background: rgba(96,165,250,.15); color: var(--info); }
-  .muted { color: var(--muted); font-size: 12px; }
-  #logs { background: #0b0d12; border-radius: 8px; padding: 10px; font: 12px/1.5 Consolas, monospace; color: #9fb0c9; max-height: 220px; overflow: auto; white-space: pre-wrap; }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
-  .inline { display: flex; gap: 8px; }
-  .inline > * { flex: 1; }
-  /* 联系人选择弹窗 */
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
-  .modal { background: var(--card); border: 1px solid var(--line); border-radius: 12px; width: min(560px, 92vw); max-height: 82vh; display: flex; flex-direction: column; padding: 16px; }
-  .modal h3 { font-size: 15px; margin-bottom: 10px; color: var(--acc2); }
-  .picker-list { overflow: auto; flex: 1; margin: 8px 0; min-height: 120px; }
-  .pick { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
-  .pick:hover { background: var(--card2); }
-  .pick input, label.row input[type=checkbox] { width: auto; }
-  .avwrap { position: relative; width: 36px; height: 36px; flex: none; }
-  .avwrap .avatar { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px; border-radius: 50%; background: #39415a; }
+  th { text-align: left; padding: 7px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--line2); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background .12s; }
+  tbody tr:hover { background: #fafbfe; }
+  .tbl-scroll { max-height: 340px; overflow: auto; margin: 0 -6px; padding: 0 6px; }
+  .tbl-scroll th { position: sticky; top: 0; background: #fff; z-index: 2; }
+  .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 28px 10px; }
+  .empty .big { font-size: 26px; display: block; margin-bottom: 6px; opacity: .8; }
+
+  /* 成员单元 */
+  .mem { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .avwrap { position: relative; width: 34px; height: 34px; flex: none; }
+  .avwrap .avatar { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px; font-weight: 600; border-radius: 50%; background: linear-gradient(135deg, #a5b4fc, #818cf8); }
   .avwrap img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
-  .pick .nm { flex: 1; min-width: 0; }
-  .pick .nm .n { font-size: 14px; }
-  .pick .nm .u { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .trow { display: flex; align-items: center; gap: 10px; }
-  .trow .avwrap { width: 32px; height: 32px; }
-  .srow { display: flex; gap: 6px; min-width: 170px; }
+  .mem .nm { min-width: 0; }
+  .mem .nm .n { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mem .nm .u { color: var(--muted); font-size: 11.5px; }
+  .uid-chip { display: inline-block; background: var(--line2); color: #5a6078; border-radius: 5px; padding: 0 6px; font-size: 11px; font-family: Consolas, monospace; }
+  .srow { display: flex; gap: 6px; }
   .srow input { min-width: 0; }
+
+  /* pill */
+  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 10px; border-radius: 99px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .pill.err { background: var(--err-soft); color: var(--err); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.info { background: var(--info-soft); color: var(--info); }
+  .muted { color: var(--muted); font-size: 12px; }
+
+  /* 日志 */
+  #logs { background: #141824; border-radius: 10px; padding: 12px 14px; font: 12px/1.65 Consolas, "Courier New", monospace; color: #9fb0c9; height: 230px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+
+  /* 手动添加 */
+  details.add-manual summary { cursor: pointer; color: var(--muted); font-size: 12.5px; user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
+  details.add-manual summary::before { content: "▸"; transition: transform .15s; font-size: 11px; }
+  details.add-manual[open] summary::before { transform: rotate(90deg); }
+  details.add-manual .inline { display: flex; gap: 8px; margin-top: 10px; }
+  details.add-manual .inline input { flex: 1; min-width: 0; }
+
+  /* ===== 弹窗 ===== */
+  .overlay { position: fixed; inset: 0; background: rgba(15,23,42,.45); backdrop-filter: blur(2px); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  .modal { background: #fff; border-radius: 16px; width: min(540px, 94vw); max-height: 84vh; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(15,23,42,.25); overflow: hidden; }
+  .modal-h { display: flex; align-items: center; justify-content: space-between; padding: 15px 18px 13px; border-bottom: 1px solid var(--line2); }
+  .modal-h h3 { font-size: 15px; font-weight: 600; }
+  .modal-x { border: 0; background: transparent; font-size: 17px; color: var(--muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+  .modal-x:hover { background: var(--line2); color: var(--text); }
+  .modal-b { padding: 14px 18px; overflow: auto; flex: 1; min-height: 120px; }
+  .modal-f { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line2); background: #fbfcfe; }
+  .pick { display: flex; align-items: center; gap: 11px; padding: 8px 9px; border-radius: 10px; cursor: pointer; transition: background .12s; }
+  .pick:hover { background: #f5f7fd; }
+  .pick input { width: auto; flex: none; }
+  .pick .nm { flex: 1; min-width: 0; }
+  .pick .nm .n { font-size: 13.5px; font-weight: 500; }
+  .pick .nm .u { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .check-all { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; cursor: pointer; }
+  .check-all input { width: auto; }
+
+  /* ===== Toast ===== */
+  #toasts { position: fixed; top: 74px; right: 22px; z-index: 60; display: flex; flex-direction: column; gap: 9px; max-width: 380px; }
+  .toast { background: #fff; border: 1px solid var(--line); border-left: 3px solid var(--info); border-radius: 10px; padding: 10px 14px; font-size: 13px; box-shadow: 0 6px 20px rgba(15,23,42,.12); opacity: 0; transform: translateX(12px); transition: all .25s ease; line-height: 1.5; }
+  .toast.in { opacity: 1; transform: none; }
+  .toast.err { border-left-color: var(--err); }
+  .toast.ok { border-left-color: var(--ok); }
+  .footer-note { text-align: center; color: #a6adc0; font-size: 11.5px; margin-top: 26px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1><span class="flame">🔥</span> 火花管家 <span style="font-size:13px;color:var(--muted)">SparkBuddy</span></h1>
-  <div class="sub">抖音火花自动维护 · 面板仅监听本机 · 请只用于自己的账号，自动操作存在平台风控风险</div>
 
-  <div class="card">
-    <div class="stats">
-      <div class="stat"><div class="k">登录状态</div><div class="v" id="s-login">-</div></div>
-      <div class="stat"><div class="k">今日进度</div><div class="v" id="s-today">-</div></div>
-      <div class="stat"><div class="k">下次发送</div><div class="v" id="s-next">-</div></div>
-      <div class="stat"><div class="k">任务状态</div><div class="v" id="s-task">空闲</div></div>
+<header class="topbar">
+  <div class="topbar-in">
+    <div class="brand"><span class="logo">🔥</span>火花管家 <small>SparkBuddy</small></div>
+    <div class="grow"></div>
+    <div class="acts">
+      <span id="login-pill" class="pill info"><span class="dot info"></span>检测中…</span>
+      <button class="btn" id="b-run" onclick="runNow()">⚡ 立即发送</button>
+      <button class="btn subtle" id="b-login" onclick="startLogin()">📱 扫码登录</button>
     </div>
-    <div style="margin-top:12px">
-      <button class="btn" id="b-login" onclick="startLogin()">📱 扫码登录</button>
-      <button class="btn gray" onclick="checkLogin()">🔍 检测登录态</button>
-      <button class="btn gray" onclick="runNow()">⚡ 立即发送</button>
-      <button class="btn danger" onclick="logout()">🗑 重置登录</button>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- KPI 指标 -->
+  <div class="kpis">
+    <div class="kpi">
+      <div class="k">今日发送 <span class="ic" style="background:var(--acc-soft)">🔥</span></div>
+      <div class="v" id="k-today">-</div>
+      <div class="s" id="k-today-sub">-</div>
+      <div class="bar"><i id="k-today-bar"></i></div>
     </div>
-    <div class="hint" id="msg"></div>
+    <div class="kpi">
+      <div class="k">下次发送 <span class="ic" style="background:var(--info-soft)">⏰</span></div>
+      <div class="v" id="k-next">-</div>
+      <div class="s" id="k-next-sub">-</div>
+    </div>
+    <div class="kpi">
+      <div class="k">登录状态 <span class="ic" style="background:var(--ok-soft)">👤</span></div>
+      <div class="v" id="k-login" style="font-size:16px">-</div>
+      <div class="s" id="k-login-sub">-</div>
+    </div>
+    <div class="kpi">
+      <div class="k">目标成员 <span class="ic" style="background:var(--warn-soft)">👥</span></div>
+      <div class="v" id="k-tgt">-</div>
+      <div class="s" id="k-tgt-sub">-</div>
+    </div>
   </div>
 
-  <div class="grid">
-    <div>
+  <div class="layout">
+    <!-- 左列 -->
+    <div class="col">
       <div class="card">
-        <h2>发送目标 <span class="muted">（从会话/搜索导入：昵称、抖音号、头像自动带上）</span></h2>
-        <div style="margin-bottom:10px">
-          <button class="btn small" onclick="openPicker('sessions')">📥 从会话列表导入</button>
-          <button class="btn small gray" onclick="openPicker('search')">🔎 搜索添加</button>
-          <button class="btn small gray" onclick="enrichUid()">🆔 补全抖音号</button>
+        <div class="card-h">
+          <div><h2>发送目标</h2><div class="desc">从会话/搜索导入：昵称、抖音号、头像自动带上</div></div>
+        </div>
+        <div class="toolbar">
+          <button class="btn small subtle" onclick="openPicker('sessions')">📥 从会话列表导入</button>
+          <button class="btn small subtle" onclick="openPicker('search')">🔎 搜索添加</button>
+          <button class="btn small subtle" onclick="enrichUid()">🆔 补全抖音号</button>
         </div>
         <table>
-          <thead><tr><th>发送</th><th>成员</th><th>单独发送</th><th></th></tr></thead>
+          <thead><tr><th style="width:44px">发送</th><th>成员</th><th style="width:218px">单独发送</th><th style="width:40px"></th></tr></thead>
           <tbody id="targets"></tbody>
         </table>
-        <div class="hint" id="t-empty" style="display:none">还没有目标：点上方按钮从会话列表或搜索中勾选添加</div>
-        <details style="margin-top:8px">
-          <summary class="muted" style="cursor:pointer">手动添加（兜底）</summary>
-          <div class="inline" style="margin-top:6px">
+        <div class="empty" id="t-empty" style="display:none"><span class="big">📭</span>还没有目标：点上方按钮从会话列表或搜索中勾选添加</div>
+        <details class="add-manual" style="margin-top:10px">
+          <summary>手动添加（兜底）</summary>
+          <div class="inline">
             <input type="text" id="t-name" placeholder="抖音昵称（需与聊天列表显示一致）">
             <input type="text" id="t-uid" placeholder="抖音号（可选，便于区分重名）">
-            <button class="btn small" style="flex:0" onclick="addTarget()">添加</button>
+            <button class="btn small" style="flex:none" onclick="addTarget()">添加</button>
           </div>
         </details>
       </div>
 
       <div class="card">
-        <h2>发送设置</h2>
-        <label class="row"><span class="lbl">每天发送时间</span><input type="time" id="c-time" style="width:120px"></label>
-        <label class="row"><span class="lbl">错过则补发</span><input type="checkbox" id="c-catchup" style="width:auto"></label>
-        <label class="row"><span class="lbl">消息间隔(秒)</span>
-          <input type="number" id="c-min" min="3" style="width:90px"> ~
-          <input type="number" id="c-max" min="4" style="width:90px">
-          <span class="muted">发完一个人后等待的时间（防风控），全员发完为止</span>
-        </label>
-        <label class="row"><span class="lbl">附加一言</span><input type="checkbox" id="c-hitokoto" style="width:auto"> <span class="muted">随机追加一句诗词/名言</span></label>
-        <button class="btn" onclick="saveConfig()">💾 保存全部设置</button>
+        <div class="card-h">
+          <div><h2>发送历史</h2><div class="desc">最近 60 条记录</div></div>
+        </div>
+        <div class="tbl-scroll" id="hist-scroll">
+          <table>
+            <thead><tr><th style="width:96px">时间</th><th style="width:96px">目标</th><th style="width:60px">结果</th><th>内容 / 详情</th></tr></thead>
+            <tbody id="hist"></tbody>
+          </table>
+          <div class="empty" id="h-empty" style="display:none"><span class="big">🗒️</span>暂无记录</div>
+        </div>
       </div>
     </div>
 
-    <div>
+    <!-- 右列 -->
+    <div class="col">
       <div class="card">
-        <h2>统一发送内容 <span class="muted">（所有目标每天收到同一条）</span></h2>
-        <input type="text" id="c-message" placeholder="今日火花+1，互帮互助 🔥">
+        <div class="card-h">
+          <div><h2>每日发送内容</h2><div class="desc">所有目标每天收到同一条</div></div>
+        </div>
+        <textarea id="c-message" placeholder="今日火花+1，互帮互助 🔥"></textarea>
         <div class="hint">想给某个人发不一样的？用目标列表里他那一行的「单独发送」框（留空则发这条统一内容）。</div>
       </div>
 
       <div class="card">
-        <h2>发送历史</h2>
-        <table>
-          <thead><tr><th>时间</th><th>目标</th><th>结果</th><th>详情</th></tr></thead>
-          <tbody id="hist"></tbody>
-        </table>
-        <div class="hint" id="h-empty" style="display:none">暂无记录</div>
+        <div class="card-h">
+          <div><h2>发送设置</h2><div class="desc">调度与防风控</div></div>
+        </div>
+        <div class="frow"><span class="lbl">每天发送时间</span><div class="val"><input type="time" id="c-time" style="width:120px"></div></div>
+        <div class="frow"><span class="lbl">错过则补发</span><div class="val"><label class="switch"><input type="checkbox" id="c-catchup"><i></i></label><span class="muted">面板启动时若已错过当天时间点则立即补发</span></div></div>
+        <div class="frow"><span class="lbl">消息间隔</span><div class="val">
+          <input type="number" id="c-min" min="3"> <span class="tilde">~</span> <input type="number" id="c-max" min="4">
+          <span class="muted">秒 / 人（防风控）</span>
+        </div></div>
+        <div class="frow"><span class="lbl">附加一言</span><div class="val"><label class="switch"><input type="checkbox" id="c-hitokoto"><i></i></label><span class="muted">随机追加一句诗词/名言</span></div></div>
+        <hr class="sep">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="muted">登录维护：<a href="javascript:void(0)" onclick="checkLogin()" style="color:var(--info)">检测登录态</a> · <a href="javascript:void(0)" onclick="logout()" style="color:var(--err)">重置登录</a></span>
+          <button class="btn" onclick="saveConfig()">💾 保存全部设置</button>
+        </div>
       </div>
 
       <div class="card">
-        <h2>运行日志 <a class="btn small gray" style="float:right" onclick="loadLogs()">刷新</a></h2>
+        <div class="card-h">
+          <div><h2>运行日志</h2><div class="desc">最近 120 行</div></div>
+          <button class="btn small subtle" onclick="loadLogs()">刷新</button>
+        </div>
         <div id="logs">加载中...</div>
       </div>
     </div>
   </div>
+
+  <div class="footer-note">面板仅监听本机（127.0.0.1:8765） · 请只用于自己的账号 · 自动操作存在平台风控风险</div>
 </div>
 
+<!-- 联系人选择弹窗 -->
 <div class="overlay" id="picker" style="display:none" onclick="if(event.target===this)closePicker()">
   <div class="modal">
-    <h3 id="picker-title">选择联系人</h3>
-    <div class="inline" id="picker-search-row" style="display:none">
-      <input type="text" id="picker-kw" placeholder="输入昵称或抖音号，回车搜索" onkeydown="if(event.key==='Enter')doSearch()">
-      <button class="btn small" style="flex:0" onclick="doSearch()">搜索</button>
+    <div class="modal-h">
+      <h3 id="picker-title">选择联系人</h3>
+      <button class="modal-x" onclick="closePicker()">✕</button>
     </div>
-    <div class="picker-list" id="picker-list"></div>
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <label style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:5px">
-        <input type="checkbox" id="picker-all" onchange="toggleAll(this.checked)"> 全选
-      </label>
-      <div>
-        <button class="btn gray small" onclick="closePicker()">取消</button>
+    <div style="padding:12px 18px 0">
+      <div class="inline" id="picker-search-row" style="display:none">
+        <input type="text" id="picker-kw" placeholder="输入昵称或抖音号，回车搜索" onkeydown="if(event.key==='Enter')doSearch()">
+        <button class="btn small" style="flex:none" onclick="doSearch()">搜索</button>
+      </div>
+    </div>
+    <div class="modal-b" id="picker-list"></div>
+    <div class="modal-f">
+      <label class="check-all"><input type="checkbox" id="picker-all" onchange="toggleAll(this.checked)"> 全选</label>
+      <div style="display:flex;gap:8px">
+        <button class="btn small subtle" onclick="closePicker()">取消</button>
         <button class="btn small" onclick="addPicked()">➕ 添加勾选项</button>
       </div>
     </div>
-    <div class="hint" id="picker-msg"></div>
+    <div class="hint" id="picker-msg" style="padding:0 18px 12px"></div>
   </div>
 </div>
+
+<div id="toasts"></div>
 
 <script>
 let CFG = null;
@@ -182,25 +317,54 @@ async function j(url, opts) {
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.msg || e.detail || r.status); }
   return r.json();
 }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* ---- Toast 提示 ---- */
 function show(msg, isErr) {
-  const el = document.getElementById('msg');
-  el.textContent = msg || '';
-  el.style.color = isErr ? 'var(--err)' : 'var(--muted)';
+  if (!msg) return;
+  const box = document.getElementById('toasts');
+  const t = document.createElement('div');
+  t.className = 'toast' + (isErr ? ' err' : '');
+  t.textContent = msg;
+  box.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('in'));
+  setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 300); }, isErr ? 6500 : 4000);
 }
 
+/* ---- 状态 ---- */
 async function refreshStatus() {
   try {
     const s = await j('/api/status');
-    const lg = document.getElementById('s-login');
-    if (s.login_browser_open) { lg.innerHTML = '<span class="pill warn">扫码中…</span>'; }
-    else if (s.login_ok) { lg.innerHTML = '<span class="pill ok">' + esc(s.nickname || '已登录') + '</span>'; }
-    else { lg.innerHTML = '<span class="pill err">未登录</span>'; }
-    document.getElementById('s-today').textContent = s.today.ok + ' / ' + s.today.total + (s.today.fail ? ' (失败' + s.today.fail + ')' : '');
-    document.getElementById('s-next').textContent = s.next.done_today ? '今日已完成' : (s.next.next_run || '-');
-    document.getElementById('s-task').innerHTML = s.task_running ? '<span class="pill warn">发送中…</span>' : '<span class="pill info">空闲</span>';
+    // 顶栏登录 pill
+    const lp = document.getElementById('login-pill');
+    if (s.login_browser_open) lp.innerHTML = '<span class="dot warn"></span>扫码中…', lp.className = 'pill warn';
+    else if (s.login_ok) lp.innerHTML = '<span class="dot ok"></span>' + esc(s.nickname || '已登录'), lp.className = 'pill ok';
+    else lp.innerHTML = '<span class="dot err"></span>未登录', lp.className = 'pill err';
+    // KPI：今日发送
+    document.getElementById('k-today').textContent = s.today.ok + ' / ' + s.today.total;
+    document.getElementById('k-today-sub').innerHTML = s.today.fail
+      ? '<span style="color:var(--err)">失败 ' + s.today.fail + '</span> · 成功 ' + s.today.ok
+      : '成功 ' + s.today.ok + ' · 失败 ' + s.today.fail;
+    document.getElementById('k-today-bar').style.width =
+      (s.today.total ? Math.min(100, Math.round(s.today.ok / s.today.total * 100)) : 0) + '%';
+    // KPI：下次发送
+    document.getElementById('k-next').textContent = s.next.done_today ? '今日已完成' : (s.next.next_run || '-');
+    document.getElementById('k-next-sub').textContent = s.task_running ? '任务进行中…' : (s.next.done_today ? '明天见 👋' : '每日定时自动发送');
+    // KPI：登录
+    const kl = document.getElementById('k-login');
+    kl.textContent = s.login_browser_open ? '扫码中…' : (s.login_ok ? (s.nickname || '已登录') : '未登录');
+    document.getElementById('k-login-sub').textContent = s.login_ok ? '登录态正常' : '点右上角「扫码登录」';
+    // KPI：目标
+    document.getElementById('k-tgt').textContent = s.targets_enabled + ' / ' + s.targets_total;
+    document.getElementById('k-tgt-sub').textContent = s.targets_enabled ? '已启用 ' + s.targets_enabled + ' 人' : '尚未添加目标';
+    // 立即发送按钮
+    const b = document.getElementById('b-run');
+    b.disabled = s.task_running;
+    b.textContent = s.task_running ? '⏳ 发送中…' : '⚡ 立即发送';
   } catch (e) { show('状态获取失败: ' + e.message, true); }
 }
 
+/* ---- 配置 ---- */
 async function refreshConfig() {
   CFG = await j('/api/config');
   document.getElementById('c-time').value = CFG.send_time || '10:00';
@@ -222,14 +386,14 @@ function renderTargets() {
     const ini = esc((t.name || '?')[0]);
     const av = '<span class="avwrap"><span class="avatar">' + ini + '</span>'
       + (t.avatar ? '<img src="' + esc(t.avatar) + '" onerror="this.remove()">' : '') + '</span>';
-    const sub = t.uid ? '抖音号:' + esc(t.uid) : '<span class="muted">无抖音号</span>';
-    tr.innerHTML = '<td><input type="checkbox" ' + (t.enabled ? 'checked' : '') + ' onchange="toggleTarget(' + i + ', this.checked)"></td>'
-      + '<td><div class="trow">' + av
-      + '<div><div>' + esc(t.name) + '</div><div class="muted" style="font-size:11px">' + sub + '</div></div></div></td>'
+    const sub = t.uid ? '<span class="uid-chip">抖音号:' + esc(t.uid) + '</span>' : '<span class="muted">无抖音号</span>';
+    tr.innerHTML = '<td><input type="checkbox" style="width:auto" ' + (t.enabled ? 'checked' : '') + ' onchange="toggleTarget(' + i + ', this.checked)"></td>'
+      + '<td><div class="mem">' + av
+      + '<div class="nm"><div class="n">' + esc(t.name) + '</div><div class="u">' + sub + '</div></div></div></td>'
       + '<td><div class="srow">'
       + '<input type="text" id="one-' + i + '" placeholder="留空=统一内容" onkeydown="if(event.key===\'Enter\')sendOne(' + i + ')">'
-      + '<button class="btn small" style="flex:0" onclick="sendOne(' + i + ')">发</button></div></td>'
-      + '<td><button class="btn small danger" onclick="delTarget(' + i + ')">删</button></td>';
+      + '<button class="btn small" style="flex:none" onclick="sendOne(' + i + ')">发</button></div></td>'
+      + '<td style="text-align:right"><button class="btn ghost small" title="删除" onclick="delTarget(' + i + ')">✕</button></td>';
     tb.appendChild(tr);
   });
 }
@@ -284,13 +448,13 @@ async function openPicker(mode) {
   document.getElementById('picker-title').textContent = mode === 'search' ? '搜索抖音用户' : '从会话列表选择';
   document.getElementById('picker-kw').value = '';
   const box = document.getElementById('picker-list');
-  box.innerHTML = '<span class="muted">正在打开浏览器获取' + (mode === 'search' ? '（先直接点搜索）' : '，约需 5-15 秒…') + '</span>';
+  box.innerHTML = '<div class="empty"><span class="big">⏳</span>正在打开浏览器获取' + (mode === 'search' ? '（先直接点搜索）' : '，约需 5-15 秒…') + '</div>';
   PICKER_ITEMS = [];
   if (mode === 'sessions') {
     try {
       const r = await j('/api/contacts/fetch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
       showPickerResult(r);
-    } catch (e) { box.innerHTML = '<span class="muted">请求失败: ' + esc(e.message) + '</span>'; }
+    } catch (e) { box.innerHTML = '<div class="empty">请求失败: ' + esc(e.message) + '</div>'; }
   }
 }
 
@@ -298,19 +462,19 @@ async function doSearch() {
   const kw = document.getElementById('picker-kw').value.trim();
   if (!kw) return;
   const box = document.getElementById('picker-list');
-  box.innerHTML = '<span class="muted">搜索中…（约 5-15 秒）</span>';
+  box.innerHTML = '<div class="empty"><span class="big">⏳</span>搜索中…（约 5-15 秒）</div>';
   PICKER_ITEMS = [];
   try {
     const r = await j('/api/contacts/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kw }) });
     showPickerResult(r);
-  } catch (e) { box.innerHTML = '<span class="muted">请求失败: ' + esc(e.message) + '</span>'; }
+  } catch (e) { box.innerHTML = '<div class="empty">请求失败: ' + esc(e.message) + '</div>'; }
 }
 
 function showPickerResult(r) {
   const box = document.getElementById('picker-list');
   if (!r.ok) {
-    box.innerHTML = '<span style="color:var(--err)">' + esc(r.msg || '获取失败') + '</span>'
-      + (r.shot ? ' · <a href="/shots/' + encodeURIComponent(r.shot) + '" target="_blank" style="color:var(--info)">查看当时页面截图</a>' : '');
+    box.innerHTML = '<div class="empty"><span class="big">⚠️</span><span style="color:var(--err)">' + esc(r.msg || '获取失败') + '</span>'
+      + (r.shot ? '<br><a href="/shots/' + encodeURIComponent(r.shot) + '" target="_blank" style="color:var(--info)">查看当时页面截图</a>' : '') + '</div>';
     return;
   }
   PICKER_ITEMS = r.contacts || [];
@@ -320,7 +484,7 @@ function showPickerResult(r) {
 function renderPicker() {
   const box = document.getElementById('picker-list');
   if (!PICKER_ITEMS.length) {
-    box.innerHTML = '<span class="muted">没有获取到联系人。可以试试「搜索添加」，或用手动添加兜底。</span>';
+    box.innerHTML = '<div class="empty"><span class="big">🫥</span>没有获取到联系人。可以试试「搜索添加」，或用手动添加兜底。</div>';
     return;
   }
   box.innerHTML = '';
@@ -397,8 +561,6 @@ async function logout() {
   try { const r = await j('/api/logout', { method: 'POST' }); show(r.msg); await refreshStatus(); }
   catch (e) { show(e.message, true); }
 }
-
-function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function loadHistory() {
   const hs = await j('/api/history?limit=60');
