@@ -1,0 +1,16 @@
+# runtime data: login cookies, config, history, screenshots
+# NEVER commit these - browser_data contains your DouYin session cookies
+data/
+logs/
+browser_data/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# local artifacts
+*.log
+*.tmp
+*.upload_bak

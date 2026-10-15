@@ -1,0 +1,237 @@
+"""spark-buddy Web 面板（FastAPI）。绑定 127.0.0.1，不对外暴露。"""
+import shutil
+import threading
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+
+from . import config, douyin, scheduler
+
+INDEX = Path(__file__).parent / "static" / "index.html"
+_stop = threading.Event()
+_sched_thread = None
+_login_thread = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _sched_thread
+    config.ensure_dirs()
+    _stop.clear()
+    _sched_thread = threading.Thread(target=scheduler.scheduler_loop, args=(_stop,), daemon=True)
+    _sched_thread.start()
+    yield
+    _stop.set()
+
+
+app = FastAPI(title="spark-buddy", lifespan=lifespan)
+
+
+def _today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+@app.get("/")
+def index():
+    return FileResponse(INDEX, media_type="text/html")
+
+
+@app.get("/api/status")
+def status():
+    cfg = config.load_config()
+    st = config.load_state()
+    today = _today()
+    ok = fail = 0
+    for e in config.read_history(500):
+        if e.get("time", "").startswith(today):
+            if e.get("ok"):
+                ok += 1
+            else:
+                fail += 1
+    enabled = [t for t in cfg.get("targets", []) if t.get("enabled", True)]
+    return {
+        "nickname": st.get("nickname", ""),
+        "login_ok": bool(st.get("login_ok")),
+        "login_browser_open": bool(_login_thread and _login_thread.is_alive()),
+        "task_running": scheduler.task_running,
+        "today": {"total": len(enabled), "ok": ok, "fail": fail},
+        "targets_enabled": len(enabled),
+        "targets_total": len(cfg.get("targets", [])),
+        "next": scheduler.next_run_info(),
+        "last_run_date": st.get("last_run_date", ""),
+    }
+
+
+@app.post("/api/login/start")
+def login_start():
+    global _login_thread
+    if _login_thread and _login_thread.is_alive():
+        return {"started": False, "msg": "登录窗口已在运行，请在弹出的浏览器中扫码"}
+    _login_thread = threading.Thread(target=douyin.login_flow, daemon=True)
+    _login_thread.start()
+    return {"started": True}
+
+
+@app.get("/api/login/poll")
+def login_poll():
+    st = douyin.login_status()
+    if st["done"]:
+        config.update_state(login_ok=True, nickname=st["nickname"])
+    return st
+
+
+@app.post("/api/login/check")
+def login_check():
+    if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
+        return JSONResponse({"ok": False, "msg": "浏览器正忙，稍后再试"}, status_code=409)
+
+    def worker():
+        ok = douyin.check_logged_in()
+        config.update_state(login_ok=ok)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True, "msg": "正在检测登录态，几秒后刷新页面查看结果"}
+
+
+@app.post("/api/logout")
+def logout():
+    if not douyin._BROWSER_LOCK.acquire(blocking=False):
+        return JSONResponse({"ok": False, "msg": "浏览器正在被其他任务使用，稍后再试"}, status_code=409)
+    try:
+        if config.BROWSER_DATA.exists():
+            shutil.rmtree(config.BROWSER_DATA, ignore_errors=True)
+        config.BROWSER_DATA.mkdir(parents=True, exist_ok=True)
+        config.update_state(login_ok=False, nickname="")
+        return {"ok": True, "msg": "登录态已清除"}
+    finally:
+        douyin._BROWSER_LOCK.release()
+
+
+@app.get("/api/config")
+def get_config():
+    return config.load_config()
+
+
+@app.post("/api/config")
+def set_config(cfg: dict):
+    old = config.load_config()
+    # 只允许覆盖已知字段，防脏数据
+    clean = {k: cfg[k] for k in old if k in cfg}
+    # targets：uid（抖音号）优先去重，无 uid 按昵称去重；兼容旧数据（无 uid）
+    targets = []
+    seen_keys = set()
+    for t in cfg.get("targets", []):
+        name = str(t.get("name", "")).strip()
+        if not name:
+            continue
+        uid = str(t.get("uid", "")).strip()
+        key = uid or ("name:" + name)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        targets.append({
+            "name": name[:40],
+            "uid": uid,
+            "avatar": str(t.get("avatar", ""))[:500],
+            "enabled": bool(t.get("enabled", True)),
+        })
+    clean["targets"] = targets
+    clean["message"] = str(cfg.get("message", "")).strip() or "✨今日火花+1"
+    try:
+        clean["min_delay"] = max(3, int(clean.get("min_delay", 30)))
+        clean["max_delay"] = max(clean["min_delay"] + 1, int(clean.get("max_delay", 90)))
+    except Exception:
+        clean["min_delay"], clean["max_delay"] = 30, 90
+    if not str(clean.get("send_time", "10:00")).count(":"):
+        clean["send_time"] = "10:00"
+    config.save_config(clean)
+    return {"ok": True, "config": clean}
+
+
+@app.get("/api/history")
+def history(limit: int = 100):
+    return config.read_history(max(1, min(limit, 500)))
+
+
+@app.post("/api/contacts/fetch")
+def contacts_fetch():
+    """打开消息中心读取会话列表（昵称/头像/预览）。同步执行，约需数秒。"""
+    if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
+        return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/发送中），稍后再试"}, status_code=409)
+    contacts, shot, err = douyin.fetch_contacts()
+    return {"ok": not err, "contacts": contacts, "shot": shot, "msg": err}
+
+
+@app.post("/api/contacts/search")
+def contacts_search(body: dict):
+    """按昵称/抖音号搜索用户。body: {kw}"""
+    if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
+        return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/发送中），稍后再试"}, status_code=409)
+    contacts, shot, err = douyin.search_users(str(body.get("kw", "")))
+    return {"ok": not err, "contacts": contacts, "shot": shot, "msg": err}
+
+
+@app.post("/api/run-now")
+def run_now():
+    if scheduler.task_running:
+        return JSONResponse({"ok": False, "msg": "任务正在运行中"}, status_code=409)
+    if _login_thread and _login_thread.is_alive():
+        return JSONResponse({"ok": False, "msg": "登录窗口开着，请先完成或关闭扫码登录"}, status_code=409)
+    threading.Thread(target=scheduler.run_daily_task, kwargs={"mark_done": False}, daemon=True).start()
+    return {"ok": True, "msg": "发送任务已启动（跳过今天已成功的目标）"}
+
+
+@app.post("/api/send-one")
+def send_one(body: dict):
+    """给单个目标发送：text 留空则用统一内容。同步执行（约 10-40 秒）。"""
+    if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
+        return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/批量发送中），稍后再试"}, status_code=409)
+    cfg = config.load_config()
+    name = str(body.get("name", "")).strip()
+    text = str(body.get("text", "")).strip() or scheduler.build_message(cfg)
+    if not name:
+        return JSONResponse({"ok": False, "msg": "缺少目标昵称"}, status_code=400)
+    if not any(t["name"] == name for t in cfg.get("targets", [])):
+        return JSONResponse({"ok": False, "msg": "「%s」不在目标列表中" % name}, status_code=400)
+
+    scheduler.task_running = True
+    try:
+        ok, detail = douyin.send_message(name, text)
+        config.add_history({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "name": name,
+            "ok": ok,
+            "detail": detail,
+            "text": text,
+        })
+        return {"ok": ok, "msg": ("%s：%s" % (name, detail)) if ok else ("%s 发送失败：%s" % (name, detail))}
+    finally:
+        scheduler.task_running = False
+
+
+@app.get("/api/logs")
+def logs(n: int = 120):
+    f = config.LOGS / "app.log"
+    if not f.exists():
+        return PlainTextResponse("(暂无日志)")
+    lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+    return PlainTextResponse("\n".join(lines[-max(10, min(n, 500)):]))
+
+
+@app.get("/shots/{name}")
+def shot(name: str):
+    if "/" in name or "\\" in name or ".." in name:
+        return JSONResponse({"error": "bad name"}, status_code=400)
+    p = config.SHOTS / name
+    if not p.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(p, media_type="image/png")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")

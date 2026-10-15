@@ -1,0 +1,112 @@
+"""spark-buddy 配置与数据存储（JSON / JSONL，线程安全）。"""
+import json
+import os
+import threading
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent.parent
+DATA = BASE / "data"
+SHOTS = DATA / "screenshots"
+LOGS = BASE / "logs"
+BROWSER_DATA = BASE / "browser_data"
+
+CONFIG_PATH = DATA / "config.json"
+STATE_PATH = DATA / "state.json"
+HISTORY_PATH = DATA / "history.jsonl"
+
+_lock = threading.Lock()
+
+DEFAULT_CONFIG = {
+    "send_time": "10:00",          # 每日发送时间 HH:MM
+    "catch_up": True,              # 错过时间后启动面板是否补发
+    "min_delay": 30,               # 每个目标之间最小间隔（秒）
+    "max_delay": 90,               # 每个目标之间最大间隔（秒）
+    "use_hitokoto": False,         # 附加一言 API 随机句子
+    "message": "今日火花+1，互帮互助 🔥",  # 统一发送内容（所有人一样）
+    "targets": [],                 # [{"uid": "抖音号", "name": "昵称", "avatar": "URL", "enabled": true}]
+}
+
+
+def _migrate(cfg):
+    """兼容旧版配置：messages 数组 → message 单字段。"""
+    if "message" not in cfg and isinstance(cfg.get("messages"), list) and cfg["messages"]:
+        cfg["message"] = str(cfg["messages"][0])
+    cfg.pop("messages", None)
+    return cfg
+
+
+def ensure_dirs():
+    for p in (DATA, SHOTS, LOGS, BROWSER_DATA):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, obj):
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_config():
+    with _lock:
+        cfg = _read_json(CONFIG_PATH, {})
+        merged = dict(DEFAULT_CONFIG)
+        merged.update({k: v for k, v in cfg.items() if v is not None})
+        return _migrate(merged)
+
+
+def save_config(cfg):
+    with _lock:
+        _write_json(CONFIG_PATH, cfg)
+
+
+def load_state():
+    with _lock:
+        return _read_json(STATE_PATH, {})
+
+
+def update_state(**kv):
+    with _lock:
+        st = _read_json(STATE_PATH, {})
+        st.update(kv)
+        _write_json(STATE_PATH, st)
+        return st
+
+
+def add_history(entry):
+    """entry: {time, name, ok, detail, screenshot}"""
+    with _lock:
+        with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_history(limit=200):
+    if not HISTORY_PATH.exists():
+        return []
+    with _lock:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+    out = []
+    for line in lines[-limit:]:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def today_ok_names(today_str):
+    """今天已成功发送的目标昵称集合。"""
+    names = set()
+    for e in read_history(500):
+        if e.get("time", "").startswith(today_str) and e.get("ok"):
+            names.add(e.get("name"))
+    return names

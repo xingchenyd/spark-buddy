@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>火花管家 · SparkBuddy</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #171a23; --card2: #1d212e; --line: #2a2f3e;
+    --text: #e8eaf0; --muted: #8b93a7; --acc: #ff6b35; --acc2: #ffd23f;
+    --ok: #4ade80; --err: #f87171; --info: #60a5fa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif; padding: 20px; }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h1 .flame { color: var(--acc); }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; color: var(--acc2); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+  .stat { background: var(--card2); border-radius: 10px; padding: 10px 16px; min-width: 130px; }
+  .stat .k { color: var(--muted); font-size: 12px; }
+  .stat .v { font-size: 18px; font-weight: 600; }
+  .btn { display: inline-block; border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 14px; color: #fff; background: var(--acc); margin: 2px 6px 2px 0; }
+  .btn:hover { filter: brightness(1.1); }
+  .btn.gray { background: #39415a; }
+  .btn.small { padding: 3px 10px; font-size: 12px; }
+  .btn.danger { background: #b3384a; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  input[type=text], input[type=time], input[type=number], textarea {
+    background: var(--card2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font-size: 14px; width: 100%;
+  }
+  textarea { resize: vertical; min-height: 90px; font-family: inherit; }
+  label.row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+  label.row .lbl { min-width: 100px; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: normal; }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 12px; }
+  .pill.ok { background: rgba(74,222,128,.15); color: var(--ok); }
+  .pill.err { background: rgba(248,113,113,.15); color: var(--err); }
+  .pill.warn { background: rgba(255,210,63,.15); color: var(--acc2); }
+  .pill.info { background: rgba(96,165,250,.15); color: var(--info); }
+  .muted { color: var(--muted); font-size: 12px; }
+  #logs { background: #0b0d12; border-radius: 8px; padding: 10px; font: 12px/1.5 Consolas, monospace; color: #9fb0c9; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .inline { display: flex; gap: 8px; }
+  .inline > * { flex: 1; }
+  /* 联系人选择弹窗 */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--card); border: 1px solid var(--line); border-radius: 12px; width: min(560px, 92vw); max-height: 82vh; display: flex; flex-direction: column; padding: 16px; }
+  .modal h3 { font-size: 15px; margin-bottom: 10px; color: var(--acc2); }
+  .picker-list { overflow: auto; flex: 1; margin: 8px 0; min-height: 120px; }
+  .pick { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+  .pick:hover { background: var(--card2); }
+  .pick input, label.row input[type=checkbox] { width: auto; }
+  .avwrap { position: relative; width: 36px; height: 36px; flex: none; }
+  .avwrap .avatar { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px; border-radius: 50%; background: #39415a; }
+  .avwrap img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+  .pick .nm { flex: 1; min-width: 0; }
+  .pick .nm .n { font-size: 14px; }
+  .pick .nm .u { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trow { display: flex; align-items: center; gap: 10px; }
+  .trow .avwrap { width: 32px; height: 32px; }
+  .srow { display: flex; gap: 6px; min-width: 170px; }
+  .srow input { min-width: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="flame">🔥</span> 火花管家 <span style="font-size:13px;color:var(--muted)">SparkBuddy</span></h1>
+  <div class="sub">抖音火花自动维护 · 面板仅监听本机 · 请只用于自己的账号，自动操作存在平台风控风险</div>
+
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="k">登录状态</div><div class="v" id="s-login">-</div></div>
+      <div class="stat"><div class="k">今日进度</div><div class="v" id="s-today">-</div></div>
+      <div class="stat"><div class="k">下次发送</div><div class="v" id="s-next">-</div></div>
+      <div class="stat"><div class="k">任务状态</div><div class="v" id="s-task">空闲</div></div>
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn" id="b-login" onclick="startLogin()">📱 扫码登录</button>
+      <button class="btn gray" onclick="checkLogin()">🔍 检测登录态</button>
+      <button class="btn gray" onclick="runNow()">⚡ 立即发送</button>
+      <button class="btn danger" onclick="logout()">🗑 重置登录</button>
+    </div>
+    <div class="hint" id="msg"></div>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>发送目标 <span class="muted">（从会话/搜索导入：昵称、抖音号、头像自动带上）</span></h2>
+        <div style="margin-bottom:10px">
+          <button class="btn small" onclick="openPicker('sessions')">📥 从会话列表导入</button>
+          <button class="btn small gray" onclick="openPicker('search')">🔎 搜索添加</button>
+        </div>
+        <table>
+          <thead><tr><th>发?</th><th>成员</th><th>单独发送</th><th></th></tr></thead>
+          <tbody id="targets"></tbody>
+        </table>
+        <div class="hint" id="t-empty" style="display:none">还没有目标：点上方按钮从会话列表或搜索中勾选添加</div>
+        <details style="margin-top:8px">
+          <summary class="muted" style="cursor:pointer">手动添加（兜底）</summary>
+          <div class="inline" style="margin-top:6px">
+            <input type="text" id="t-name" placeholder="抖音昵称（需与聊天列表显示一致）">
+            <button class="btn small" style="flex:0" onclick="addTarget()">添加</button>
+          </div>
+        </details>
+      </div>
+
+      <div class="card">
+        <h2>发送设置</h2>
+        <label class="row"><span class="lbl">每天发送时间</span><input type="time" id="c-time" style="width:120px"></label>
+        <label class="row"><span class="lbl">错过则补发</span><input type="checkbox" id="c-catchup" style="width:auto"></label>
+        <label class="row"><span class="lbl">消息间隔(秒)</span>
+          <input type="number" id="c-min" min="3" style="width:90px"> ~
+          <input type="number" id="c-max" min="4" style="width:90px">
+          <span class="muted">发完一个人后等待的时间（防风控），全员发完为止</span>
+        </label>
+        <label class="row"><span class="lbl">附加一言</span><input type="checkbox" id="c-hitokoto" style="width:auto"> <span class="muted">随机追加一句诗词/名言</span></label>
+        <button class="btn" onclick="saveConfig()">💾 保存全部设置</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>统一发送内容 <span class="muted">（所有目标每天收到同一条）</span></h2>
+        <input type="text" id="c-message" placeholder="今日火花+1，互帮互助 🔥">
+        <div class="hint">想给某个人发不一样的？用目标列表里他那一行的「单独发送」框（留空则发这条统一内容）。</div>
+      </div>
+
+      <div class="card">
+        <h2>发送历史</h2>
+        <table>
+          <thead><tr><th>时间</th><th>目标</th><th>结果</th><th>详情</th></tr></thead>
+          <tbody id="hist"></tbody>
+        </table>
+        <div class="hint" id="h-empty" style="display:none">暂无记录</div>
+      </div>
+
+      <div class="card">
+        <h2>运行日志 <a class="btn small gray" style="float:right" onclick="loadLogs()">刷新</a></h2>
+        <div id="logs">加载中...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="picker" style="display:none" onclick="if(event.target===this)closePicker()">
+  <div class="modal">
+    <h3 id="picker-title">选择联系人</h3>
+    <div class="inline" id="picker-search-row" style="display:none">
+      <input type="text" id="picker-kw" placeholder="输入昵称或抖音号，回车搜索" onkeydown="if(event.key==='Enter')doSearch()">
+      <button class="btn small" style="flex:0" onclick="doSearch()">搜索</button>
+    </div>
+    <div class="picker-list" id="picker-list"></div>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <label style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:5px">
+        <input type="checkbox" id="picker-all" onchange="toggleAll(this.checked)"> 全选
+      </label>
+      <div>
+        <button class="btn gray small" onclick="closePicker()">取消</button>
+        <button class="btn small" onclick="addPicked()">➕ 添加勾选项</button>
+      </div>
+    </div>
+    <div class="hint" id="picker-msg"></div>
+  </div>
+</div>
+
+<script>
+let CFG = null;
+
+async function j(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.msg || e.detail || r.status); }
+  return r.json();
+}
+function show(msg, isErr) {
+  const el = document.getElementById('msg');
+  el.textContent = msg || '';
+  el.style.color = isErr ? 'var(--err)' : 'var(--muted)';
+}
+
+async function refreshStatus() {
+  try {
+    const s = await j('/api/status');
+    const lg = document.getElementById('s-login');
+    if (s.login_browser_open) { lg.innerHTML = '<span class="pill warn">扫码中…</span>'; }
+    else if (s.login_ok) { lg.innerHTML = '<span class="pill ok">' + esc(s.nickname || '已登录') + '</span>'; }
+    else { lg.innerHTML = '<span class="pill err">未登录</span>'; }
+    document.getElementById('s-today').textContent = s.today.ok + ' / ' + s.today.total + (s.today.fail ? ' (失败' + s.today.fail + ')' : '');
+    document.getElementById('s-next').textContent = s.next.done_today ? '今日已完成' : (s.next.next_run || '-');
+    document.getElementById('s-task').innerHTML = s.task_running ? '<span class="pill warn">发送中…</span>' : '<span class="pill info">空闲</span>';
+  } catch (e) { show('状态获取失败: ' + e.message, true); }
+}
+
+async function refreshConfig() {
+  CFG = await j('/api/config');
+  document.getElementById('c-time').value = CFG.send_time || '10:00';
+  document.getElementById('c-catchup').checked = !!CFG.catch_up;
+  document.getElementById('c-min').value = CFG.min_delay;
+  document.getElementById('c-max').value = CFG.max_delay;
+  document.getElementById('c-hitokoto').checked = !!CFG.use_hitokoto;
+  document.getElementById('c-message').value = CFG.message || '';
+  renderTargets();
+}
+
+function renderTargets() {
+  const tb = document.getElementById('targets');
+  tb.innerHTML = '';
+  const ts = CFG.targets || [];
+  document.getElementById('t-empty').style.display = ts.length ? 'none' : '';
+  ts.forEach((t, i) => {
+    const tr = document.createElement('tr');
+    const ini = esc((t.name || '?')[0]);
+    const av = '<span class="avwrap"><span class="avatar">' + ini + '</span>'
+      + (t.avatar ? '<img src="' + esc(t.avatar) + '" onerror="this.remove()">' : '') + '</span>';
+    const sub = t.uid ? '抖音号:' + esc(t.uid) : '<span class="muted">无抖音号</span>';
+    tr.innerHTML = '<td><input type="checkbox" ' + (t.enabled ? 'checked' : '') + ' onchange="toggleTarget(' + i + ', this.checked)"></td>'
+      + '<td><div class="trow">' + av
+      + '<div><div>' + esc(t.name) + '</div><div class="muted" style="font-size:11px">' + sub + '</div></div></div></td>'
+      + '<td><div class="srow">'
+      + '<input type="text" id="one-' + i + '" placeholder="留空=统一内容" onkeydown="if(event.key===\'Enter\')sendOne(' + i + ')">'
+      + '<button class="btn small" style="flex:0" onclick="sendOne(' + i + ')">发</button></div></td>'
+      + '<td><button class="btn small danger" onclick="delTarget(' + i + ')">删</button></td>';
+    tb.appendChild(tr);
+  });
+}
+
+function addTarget() {
+  const n = document.getElementById('t-name').value.trim();
+  if (!n) return show('请输入昵称', true);
+  CFG.targets = CFG.targets || [];
+  if (CFG.targets.some(t => t.name === n)) return show('该昵称已存在', true);
+  CFG.targets.push({ name: n, uid: '', avatar: '', enabled: true });
+  document.getElementById('t-name').value = '';
+  saveConfig().then(() => show('已添加 ' + n + ' 并保存'));
+}
+
+async function sendOne(i) {
+  const t = (CFG.targets || [])[i];
+  if (!t) return;
+  const input = document.getElementById('one-' + i);
+  const text = (input ? input.value : '').trim();
+  show('正在给 ' + t.name + ' 单独发送…（约 10-40 秒，失败会自动重试一次）');
+  try {
+    const r = await j('/api/send-one', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: t.name, text: text }) });
+    show(r.msg, !r.ok);
+    loadHistory();
+  } catch (e) { show('单独发送失败: ' + e.message, true); }
+}
+function delTarget(i) { CFG.targets.splice(i, 1); saveConfig().then(refreshConfig); }
+function toggleTarget(i, v) { CFG.targets[i].enabled = v; saveConfig(); }
+
+/* ---- 联系人选择弹窗 ---- */
+let PICKER_ITEMS = [];
+let PICKER_MODE = 'sessions';
+
+async function openPicker(mode) {
+  PICKER_MODE = mode;
+  document.getElementById('picker').style.display = 'flex';
+  document.getElementById('picker-msg').textContent = '';
+  document.getElementById('picker-search-row').style.display = mode === 'search' ? 'flex' : 'none';
+  document.getElementById('picker-title').textContent = mode === 'search' ? '搜索抖音用户' : '从会话列表选择';
+  document.getElementById('picker-kw').value = '';
+  const box = document.getElementById('picker-list');
+  box.innerHTML = '<span class="muted">正在打开浏览器获取' + (mode === 'search' ? '（先直接点搜索）' : '，约需 5-15 秒…') + '</span>';
+  PICKER_ITEMS = [];
+  if (mode === 'sessions') {
+    try {
+      const r = await j('/api/contacts/fetch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      showPickerResult(r);
+    } catch (e) { box.innerHTML = '<span class="muted">请求失败: ' + esc(e.message) + '</span>'; }
+  }
+}
+
+async function doSearch() {
+  const kw = document.getElementById('picker-kw').value.trim();
+  if (!kw) return;
+  const box = document.getElementById('picker-list');
+  box.innerHTML = '<span class="muted">搜索中…（约 5-15 秒）</span>';
+  PICKER_ITEMS = [];
+  try {
+    const r = await j('/api/contacts/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kw }) });
+    showPickerResult(r);
+  } catch (e) { box.innerHTML = '<span class="muted">请求失败: ' + esc(e.message) + '</span>'; }
+}
+
+function showPickerResult(r) {
+  const box = document.getElementById('picker-list');
+  if (!r.ok) {
+    box.innerHTML = '<span style="color:var(--err)">' + esc(r.msg || '获取失败') + '</span>'
+      + (r.shot ? ' · <a href="/shots/' + encodeURIComponent(r.shot) + '" target="_blank" style="color:var(--info)">查看当时页面截图</a>' : '');
+    return;
+  }
+  PICKER_ITEMS = r.contacts || [];
+  renderPicker();
+}
+
+function renderPicker() {
+  const box = document.getElementById('picker-list');
+  if (!PICKER_ITEMS.length) {
+    box.innerHTML = '<span class="muted">没有获取到联系人。可以试试「搜索添加」，或用手动添加兜底。</span>';
+    return;
+  }
+  box.innerHTML = '';
+  PICKER_ITEMS.forEach((c, i) => {
+    const div = document.createElement('label');
+    div.className = 'pick';
+    const ini = esc((c.name || '?')[0]);
+    const av = '<span class="avwrap"><span class="avatar">' + ini + '</span>'
+      + (c.avatar ? '<img src="' + esc(c.avatar) + '" onerror="this.remove()">' : '') + '</span>';
+    const sub = (c.uid ? '抖音号:' + esc(c.uid) : '未识别到抖音号')
+      + (c.preview ? ' · ' + esc(c.preview) : '');
+    div.innerHTML = '<input type="checkbox" checked data-i="' + i + '">'
+      + av
+      + '<div class="nm"><div class="n">' + esc(c.name) + '</div><div class="u">' + sub + '</div></div>';
+    box.appendChild(div);
+  });
+}
+
+function addPicked() {
+  const boxes = document.querySelectorAll('#picker-list input[type=checkbox]:checked');
+  if (!boxes.length) { document.getElementById('picker-msg').textContent = '请先勾选要添加的联系人'; return; }
+  CFG.targets = CFG.targets || [];
+  let added = 0, dup = 0;
+  boxes.forEach(b => {
+    const c = PICKER_ITEMS[+b.dataset.i];
+    if (!c) return;
+    const key = c.uid || ('name:' + c.name);
+    if (CFG.targets.some(t => (t.uid || ('name:' + t.name)) === key)) { dup++; return; }
+    CFG.targets.push({ name: c.name, uid: c.uid || '', avatar: c.avatar || '', enabled: true });
+    added++;
+  });
+  closePicker();
+  saveConfig().then(() => show('已添加 ' + added + ' 个目标' + (dup ? '（' + dup + ' 个重复已跳过）' : '') + ' 并保存'));
+}
+
+function toggleAll(v) { document.querySelectorAll('#picker-list input[type=checkbox]').forEach(b => b.checked = v); }
+function closePicker() { document.getElementById('picker').style.display = 'none'; }
+
+async function saveConfig() {
+  CFG.send_time = document.getElementById('c-time').value || '10:00';
+  CFG.catch_up = document.getElementById('c-catchup').checked;
+  CFG.min_delay = parseInt(document.getElementById('c-min').value) || 30;
+  CFG.max_delay = parseInt(document.getElementById('c-max').value) || 90;
+  CFG.use_hitokoto = document.getElementById('c-hitokoto').checked;
+  CFG.message = document.getElementById('c-message').value.trim() || '✨今日火花+1';
+  await j('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CFG) });
+  show('设置已保存 ✓');
+  await refreshConfig();
+  await refreshStatus();
+}
+
+async function startLogin() {
+  const r = await j('/api/login/start', { method: 'POST' });
+  show(r.msg || '已弹出浏览器，请用抖音 APP 扫码登录（完成后此页面会自动更新）');
+  const t = setInterval(async () => {
+    try {
+      const p = await j('/api/login/poll');
+      if (p.done) { clearInterval(t); show('登录成功：' + (p.nickname || '已登录')); await refreshStatus(); }
+      else if (!(await j('/api/status')).login_browser_open) { clearInterval(t); show('登录窗口已关闭，未完成扫码', true); }
+    } catch (e) { clearInterval(t); }
+  }, 2000);
+}
+
+async function checkLogin() {
+  const r = await j('/api/login/check', { method: 'POST' });
+  show(r.msg); setTimeout(refreshStatus, 8000);
+}
+async function runNow() {
+  const r = await j('/api/run-now', { method: 'POST' });
+  show(r.msg); setTimeout(() => { refreshStatus(); loadHistory(); }, 3000);
+}
+async function logout() {
+  if (!confirm('确认清除登录态？之后需要重新扫码。')) return;
+  try { const r = await j('/api/logout', { method: 'POST' }); show(r.msg); await refreshStatus(); }
+  catch (e) { show(e.message, true); }
+}
+
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function loadHistory() {
+  const hs = await j('/api/history?limit=60');
+  const tb = document.getElementById('hist');
+  tb.innerHTML = '';
+  document.getElementById('h-empty').style.display = hs.length ? 'none' : '';
+  hs.slice().reverse().forEach(h => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td class="muted">' + esc((h.time || '').slice(5, 16)) + '</td><td>' + esc(h.name) + '</td>'
+      + '<td>' + (h.ok ? '<span class="pill ok">成功</span>' : '<span class="pill err">失败</span>') + '</td>'
+      + '<td class="muted">' + esc((h.text ? '「' + h.text.slice(0, 30) + '」 ' : '') + (h.detail || '')) + '</td>';
+    tb.appendChild(tr);
+  });
+}
+
+async function loadLogs() {
+  try {
+    const r = await fetch('/api/logs?n=120');
+    document.getElementById('logs').textContent = await r.text();
+  } catch (e) { document.getElementById('logs').textContent = '日志加载失败'; }
+}
+
+refreshStatus(); refreshConfig(); loadHistory(); loadLogs();
+setInterval(refreshStatus, 5000);
+setInterval(loadHistory, 15000);
+</script>
+</body>
+</html>
