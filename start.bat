@@ -1,31 +1,34 @@
 @echo off
 rem ============================================================
-rem  SparkBuddy - One-click launcher
-rem  Starts the web panel on http://127.0.0.1:8765, WAITS until
-rem  it is really listening, then opens the browser.
-rem  Keep the "SparkBuddy Panel" window open. Close it to stop.
+rem  SparkBuddy - One-click launcher (silent)
+rem  Runs the panel hidden in background (pythonw, no window),
+rem  waits until the port is really up, opens the browser, then
+rem  this launcher window closes by itself.
+rem  To stop the panel: click "停止面板" in the panel settings.
 rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set PY=%~dp0.venv\Scripts\python.exe
-if not exist "%PY%" (
-    echo [ERROR] venv python not found: %PY%
+set PYW=%~dp0.venv\Scripts\pythonw.exe
+if not exist "%PYW%" (
+    echo [ERROR] venv pythonw not found: %PYW%
     pause
     exit /b 1
 )
 
-echo Starting SparkBuddy panel on http://127.0.0.1:8765 ...
-rem cmd /c wrapper: if uvicorn crashes, the window stays open with the error
-start "SparkBuddy Panel" cmd /c ""%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8765 & echo. & echo [!] Panel process exited. Read the error above if any. & pause >nul"
+echo Starting SparkBuddy panel in background...
+rem pythonw = no console window; start = don't block this launcher.
+rem If the panel is already running, this new instance fails to
+rem bind port 8765 and exits silently - harmless.
+start "" "%PYW%" -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 
-echo Waiting for the panel to come up (first start after reboot can be slow)...
+echo Waiting for the panel to come up (first start can be slow)...
 set /a TRIES=0
 :waitup
 set /a TRIES+=1
 if %TRIES% GTR 40 (
     echo [ERROR] Panel did not start within 40 seconds.
-    echo Possible causes: port 8765 already occupied, or antivirus blocked python.
+    echo Possible causes: antivirus blocked python, or install.bat was not run.
     pause
     exit /b 1
 )
@@ -37,8 +40,4 @@ if errorlevel 1 (
 
 echo Panel is up - opening browser...
 start "" http://127.0.0.1:8765
-echo.
-echo SparkBuddy is running in the "SparkBuddy Panel" window.
-echo Keep that window open while tasks are scheduled; close it to stop.
-timeout /t 8 >nul
-endlocal
+exit /b 0

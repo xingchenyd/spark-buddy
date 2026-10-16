@@ -264,7 +264,7 @@
         <div class="frow"><span class="lbl">附加一言</span><div class="val"><label class="switch"><input type="checkbox" id="c-hitokoto"><i></i></label><span class="muted">随机追加一句诗词/名言</span></div></div>
         <hr class="sep">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <span class="muted">登录维护：<a href="javascript:void(0)" onclick="checkLogin()" style="color:var(--info)">检测登录态</a> · <a href="javascript:void(0)" onclick="logout()" style="color:var(--err)">重置登录</a></span>
+          <span class="muted">登录维护：<a href="javascript:void(0)" onclick="checkLogin()" style="color:var(--info)">检测登录态</a> · <a href="javascript:void(0)" onclick="logout()" style="color:var(--err)">重置登录</a> · <a href="javascript:void(0)" onclick="shutdownPanel()">停止面板</a></span>
           <button class="btn" onclick="saveConfig()">💾 保存全部设置</button>
         </div>
       </div>
@@ -560,6 +560,16 @@ async function logout() {
   if (!confirm('确认清除登录态？之后需要重新扫码。')) return;
   try { const r = await j('/api/logout', { method: 'POST' }); show(r.msg); await refreshStatus(); }
   catch (e) { show(e.message, true); }
+}
+
+async function shutdownPanel() {
+  if (!confirm('停止面板后，今天的定时发送也会暂停，直到再次双击桌面快捷方式启动。\n确认停止面板？')) return;
+  try {
+    const r = await j('/api/shutdown', { method: 'POST' });
+    show(r.msg || '面板正在停止…');
+  } catch (e) {
+    show('面板已停止。', false);
+  }
 }
 
 async function loadHistory() {

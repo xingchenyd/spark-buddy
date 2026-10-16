@@ -1,6 +1,8 @@
 """spark-buddy Web 面板（FastAPI）。绑定 127.0.0.1，不对外暴露。"""
+import os
 import shutil
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -235,6 +237,22 @@ def send_one(body: dict):
         return {"ok": ok, "msg": ("%s：%s" % (name, detail)) if ok else ("%s 发送失败：%s" % (name, detail))}
     finally:
         scheduler.task_running = False
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    """停止面板进程（面板以无窗口方式后台运行时，由此接口负责退出）。"""
+    if scheduler.task_running:
+        return JSONResponse({"ok": False, "msg": "发送任务进行中，无法停止"}, status_code=409)
+    if _login_thread and _login_thread.is_alive():
+        return JSONResponse({"ok": False, "msg": "登录窗口开着，请先完成或关闭扫码登录"}, status_code=409)
+
+    def _exit():
+        time.sleep(0.6)  # 等响应先发回浏览器
+        os._exit(0)
+
+    threading.Thread(target=_exit, daemon=True).start()
+    return {"ok": True, "msg": "面板正在停止，定时发送随之暂停。下次双击快捷方式即可重新启动。"}
 
 
 @app.get("/api/logs")
