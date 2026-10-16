@@ -39,8 +39,59 @@ def _log(msg):
     (config.LOGS / "app.log").open("a", encoding="utf-8").write(line + "\n")
 
 
+def _flush_avatars():
+    """把发送时顺手抓到的头像（douyin.AVATAR_HARVEST）写回缺头像的目标。"""
+    try:
+        harvested = getattr(douyin, "AVATAR_HARVEST", None)
+        if not harvested:
+            return
+        cfg = config.load_config()
+        changed = []
+        for t in cfg.get("targets", []):
+            if (t.get("avatar") or "").strip():
+                continue
+            av = (harvested.get(t.get("name")) or "").strip()
+            if av:
+                t["avatar"] = av
+                changed.append(t.get("name"))
+        if changed:
+            config.save_config(cfg)
+            _log("头像已随发送补全: %s" % "、".join(changed))
+    except Exception as e:
+        _log("flush avatars error: %r" % e)
+
+
+def _send_round(todo, cfg):
+    """发送一轮：逐个发送（失败不当场重试），登录失效即中止。"""
+    stat = {"total": len(todo), "ok": 0, "fail": 0}
+    lo = max(3, int(cfg.get("min_delay", 30)))
+    hi = max(lo + 1, int(cfg.get("max_delay", 90)))
+    text = build_message(cfg)
+    for i, t in enumerate(todo):
+        name = t["name"].strip()
+        ok, detail = douyin.send_message(name, text)
+        config.add_history({
+            "time": _now().strftime("%Y-%m-%d %H:%M:%S"),
+            "name": name,
+            "ok": ok,
+            "detail": detail,
+            "text": text,
+        })
+        stat["ok" if ok else "fail"] += 1
+        if not ok and isinstance(detail, str) and "登录态已失效" in detail:
+            _log("登录失效，终止本次任务")
+            break
+        if i < len(todo) - 1:
+            d = random.uniform(lo, hi)
+            _log("等待 %.0fs 后发送下一个" % d)
+            time.sleep(d)
+    return stat
+
+
 def run_daily_task(mark_done=True):
-    """执行一次发送任务：跳过今天已成功的目标。返回统计 dict。"""
+    """执行一次发送任务：跳过今天已成功的目标。返回统计 dict。
+    失败不当场重试（2026-10-16 规则）；second_round 开启时全部跑完一遍后
+    对失败者追加一轮（默认关闭——名称正确本不会失败，失败者用「立即发送」补）。"""
     global task_running
     with _task_lock:
         if task_running:
@@ -56,33 +107,22 @@ def run_daily_task(mark_done=True):
         if not todo:
             if mark_done:
                 config.update_state(last_run_date=today)
+            _flush_avatars()
             return {"total": 0, "ok": 0, "fail": 0}
 
-        stat = {"total": len(todo), "ok": 0, "fail": 0}
-        lo = max(3, int(cfg.get("min_delay", 30)))
-        hi = max(lo + 1, int(cfg.get("max_delay", 90)))
-        text = build_message(cfg)
-        for i, t in enumerate(todo):
-            name = t["name"].strip()
-            ok, detail = douyin.send_message(name, text)
-            config.add_history({
-                "time": _now().strftime("%Y-%m-%d %H:%M:%S"),
-                "name": name,
-                "ok": ok,
-                "detail": detail,
-                "text": text,
-            })
-            stat["ok" if ok else "fail"] += 1
-            if not ok and isinstance(detail, str) and "登录态已失效" in detail:
-                _log("登录失效，终止本次任务")
-                break
-            if i < len(todo) - 1:
-                d = random.uniform(lo, hi)
-                _log("等待 %.0fs 后发送下一个" % d)
-                time.sleep(d)
+        stat = _send_round(todo, cfg)
+        if cfg.get("second_round") and stat["ok"]:
+            ok_now = config.today_ok_names(today)
+            failed = [t for t in todo if t["name"] not in ok_now]
+            if failed:
+                _log("second round: 对 %d 个失败目标追加一轮" % len(failed))
+                stat2 = _send_round(failed, cfg)
+                stat["ok"] += stat2["ok"]
+                stat["fail"] = stat["total"] - stat["ok"]
         if mark_done:
             # 当天只跑一轮：失败的目标可用面板「立即发送」补发
             config.update_state(last_run_date=today)
+        _flush_avatars()
         _log("finished: %s" % stat)
         return stat
     finally:

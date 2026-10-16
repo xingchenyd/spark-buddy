@@ -176,11 +176,58 @@ def history(limit: int = 100):
 
 @app.post("/api/contacts/fetch")
 def contacts_fetch():
-    """打开消息中心读取会话列表（昵称/头像/预览）。同步执行，约需数秒。"""
+    """打开消息中心读取会话列表（昵称/头像/预览/火花数）。同步执行，约需数秒。"""
     if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
         return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/发送中），稍后再试"}, status_code=409)
     contacts, shot, err = douyin.fetch_contacts()
     return {"ok": not err, "contacts": contacts, "shot": shot, "msg": err}
+
+
+@app.post("/api/contacts/import-spark")
+def contacts_import_spark():
+    """一键导入全部带火花的好友（首次使用零配置起步）。
+    只添加带火花且未在目标列表中的会话；已有的目标不动。"""
+    if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
+        return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/发送中），稍后再试"}, status_code=409)
+    sessions, shot, err = douyin.fetch_sessions()
+    if err and not sessions:
+        return JSONResponse({"ok": False, "msg": err, "shot": shot})
+    cfg = config.load_config()
+    existing = set()
+    for t in cfg.get("targets", []):
+        existing.add((t.get("uid") or "").strip() or ("name:" + t.get("name", "")))
+        existing.add("name:" + t.get("name", ""))
+    added = []
+    for c in sessions:
+        name = str(c.get("name", "")).strip()
+        try:
+            spark = int(c.get("spark") or 0)
+        except Exception:
+            spark = 0
+        if not name or spark <= 0:
+            continue
+        key = (c.get("uid") or "").strip() or ("name:" + name)
+        if key in existing:
+            continue
+        cfg.setdefault("targets", []).append({
+            "name": name,
+            "uid": str(c.get("uid", "")),
+            "avatar": str(c.get("avatar", "")),
+            "enabled": True,
+        })
+        existing.add(key)
+        existing.add("name:" + name)
+        added.append(name)
+    if added:
+        config.save_config(cfg)
+    return {
+        "ok": True,
+        "added": len(added),
+        "names": added,
+        "sessions": len(sessions),
+        "msg": ("已导入 %d 位火花好友：%s" % (len(added), "、".join(added))) if added
+               else "没有需要导入的（带火花的会话都已在目标列表中）",
+    }
 
 
 @app.post("/api/contacts/search")
@@ -250,6 +297,7 @@ def send_one(body: dict):
             "detail": detail,
             "text": text,
         })
+        scheduler._flush_avatars()   # 单独发送也可能顺手抓到头像
         return {"ok": ok, "msg": ("%s：%s" % (name, detail)) if ok else ("%s 发送失败：%s" % (name, detail))}
     finally:
         scheduler.task_running = False

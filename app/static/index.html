@@ -209,6 +209,7 @@
         </div>
         <div class="toolbar">
           <button class="btn small subtle" onclick="openPicker('sessions')">📥 从会话列表导入</button>
+          <button class="btn small subtle" onclick="importSpark()">⚡ 一键导入全部火花好友</button>
           <button class="btn small subtle" onclick="openPicker('search')">🔎 搜索添加</button>
           <button class="btn small subtle" onclick="enrichUid()">🆔 补全抖音号</button>
         </div>
@@ -262,6 +263,7 @@
           <span class="muted">秒 / 人（防风控）</span>
         </div></div>
         <div class="frow"><span class="lbl">附加一言</span><div class="val"><label class="switch"><input type="checkbox" id="c-hitokoto"><i></i></label><span class="muted">随机追加一句诗词/名言</span></div></div>
+        <div class="frow"><span class="lbl">失败追加第二轮</span><div class="val"><label class="switch"><input type="checkbox" id="c-second"><i></i></label><span class="muted">默认关：全部跑完一遍后对失败者再发一轮（失败也可用「立即发送」统一补发）</span></div></div>
         <hr class="sep">
         <div style="display:flex;justify-content:space-between;align-items:center">
           <span class="muted">登录维护：<a href="javascript:void(0)" onclick="checkLogin()" style="color:var(--info)">检测登录态</a> · <a href="javascript:void(0)" onclick="logout()" style="color:var(--err)">重置登录</a> · <a href="javascript:void(0)" onclick="shutdownPanel()">停止面板</a></span>
@@ -361,6 +363,7 @@ async function refreshStatus() {
     const b = document.getElementById('b-run');
     b.disabled = s.task_running;
     b.textContent = s.task_running ? '⏳ 发送中…' : '⚡ 立即发送';
+    maybeAutoImport(s);
   } catch (e) { show('状态获取失败: ' + e.message, true); }
 }
 
@@ -372,6 +375,7 @@ async function refreshConfig() {
   document.getElementById('c-min').value = CFG.min_delay;
   document.getElementById('c-max').value = CFG.max_delay;
   document.getElementById('c-hitokoto').checked = !!CFG.use_hitokoto;
+  document.getElementById('c-second').checked = !!CFG.second_round;
   document.getElementById('c-message').value = CFG.message || '';
   renderTargets();
 }
@@ -421,12 +425,34 @@ async function enrichUid() {
   } catch (e) { show('补全失败: ' + e.message, true); }
 }
 
+async function importSpark(silent) {
+  if (!silent) show('正在一键导入全部带火花的好友…（约 5-20 秒）');
+  try {
+    const r = await j('/api/contacts/import-spark', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!r.ok) { if (!silent) show(r.msg || '导入失败', true); return false; }
+    await refreshConfig(); await refreshStatus();
+    if (r.added) { closePicker(); show('⚡ 已自动导入 ' + r.added + ' 位火花好友并全部启用，可在列表中调整'); }
+    else if (!silent) show(r.msg || '没有需要导入的火花好友');
+    return true;
+  } catch (e) { if (!silent) show('导入失败: ' + e.message, true); return false; }
+}
+
+/* 首次使用自动导入：登录后目标列表为空时，自动导入全部带火花的好友 */
+let AUTO_IMPORT_TRIED = false;
+async function maybeAutoImport(s) {
+  if (AUTO_IMPORT_TRIED || !s.login_ok || s.task_running) return;
+  if ((s.targets_total || 0) > 0) { AUTO_IMPORT_TRIED = true; return; }
+  AUTO_IMPORT_TRIED = true;
+  show('首次使用：正在自动导入全部带火花的好友…');
+  await importSpark(true);
+}
+
 async function sendOne(i) {
   const t = (CFG.targets || [])[i];
   if (!t) return;
   const input = document.getElementById('one-' + i);
   const text = (input ? input.value : '').trim();
-  show('正在给 ' + t.name + ' 单独发送…（约 10-40 秒，失败会自动重试一次）');
+  show('正在给 ' + t.name + ' 单独发送…（约 10-40 秒；失败后可用「立即发送」统一补发）');
   try {
     const r = await j('/api/send-one', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: t.name, text: text }) });
     show(r.msg, !r.ok);
@@ -529,6 +555,7 @@ async function saveConfig() {
   CFG.min_delay = parseInt(document.getElementById('c-min').value) || 30;
   CFG.max_delay = parseInt(document.getElementById('c-max').value) || 90;
   CFG.use_hitokoto = document.getElementById('c-hitokoto').checked;
+  CFG.second_round = document.getElementById('c-second').checked;
   CFG.message = document.getElementById('c-message').value.trim() || '✨今日火花+1';
   await j('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CFG) });
   show('设置已保存 ✓');

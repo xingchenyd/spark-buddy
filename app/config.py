@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "min_delay": 30,               # 每个目标之间最小间隔（秒）
     "max_delay": 90,               # 每个目标之间最大间隔（秒）
     "use_hitokoto": False,         # 附加一言 API 随机句子
+    "second_round": False,         # 全部跑完一遍后对失败者追加第二轮（默认关闭）
     "message": "今日火花+1，互帮互助 🔥",  # 统一发送内容（所有人一样）
     "targets": [],                 # [{"uid": "抖音号", "name": "昵称", "avatar": "URL", "enabled": true}]
 }

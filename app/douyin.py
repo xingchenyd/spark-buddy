@@ -66,6 +66,8 @@ _page = None
 # 登录线程内部更新、对外只读的扫码状态（避免 playwright 对象跨线程调用）
 _login_done = False
 _login_nickname = ""
+# 发送流程中顺手抓到的头像 {昵称: URL}（发送结束由调度层写入配置，零额外开销）
+AVATAR_HARVEST = {}
 
 
 class NotLoggedIn(Exception):
@@ -311,21 +313,78 @@ def _match_conversation_item(page, name):
 
 
 def _wait_conversation_item(page, name, timeout_s=10):
-    """等待目标会话项出现；期间把鼠标悬到侧栏上小幅滚动（目标会话可能排在列表底部）。"""
+    """等待目标会话项出现；期间在会话列表容器内部滚动（目标可能排在列表底部，
+    且列表是虚拟渲染——不滚进视口就不会出现在 DOM 里）。"""
     deadline = time.time() + timeout_s
+    scrolled_to_bottom = False
+    _scroll_conv_list(page, -100000)   # 先滚回顶部（虚拟列表可能保留了上次滚动位置）
     while time.time() < deadline:
         it = _match_conversation_item(page, name)
         if it is not None:
             return it
-        try:
-            dlg = page.locator(IM_DIALOG).first
-            if dlg.is_visible(timeout=500):
-                dlg.hover(timeout=800)
-            page.mouse.wheel(0, 240)
-        except Exception:
-            pass
+        if scrolled_to_bottom:
+            page.wait_for_timeout(600)
+            continue
+        if not _scroll_conv_list(page, 320):
+            # 滚到底了还找不到，剩下的时间只做轮询（列表可能仍在加载）
+            scrolled_to_bottom = True
         page.wait_for_timeout(600)
     return None
+
+
+def _harvest_item_avatar(item, name):
+    """从会话项/搜索结果项里顺手抓头像 URL（与联系人提取同源，最可靠）。
+    抓到存入 AVATAR_HARVEST，发送结束由调度层写回配置（只补缺头像的目标）。"""
+    try:
+        img = item.locator("img").first
+        src = (img.get_attribute("src", timeout=800) or "").strip()
+        if src.startswith("//"):
+            src = "https:" + src
+        if src.startswith("http") and len(src) > 20:
+            AVATAR_HARVEST[name] = src
+    except Exception:
+        pass
+
+
+def _scroll_conv_list(page, delta):
+    """在会话列表容器内部滚动（容器从 conversation-item 向上找最近的可滚动祖先）。
+    返回 True 表示仍在列表中且执行了滚动；False 表示到底或列表未渲染。"""
+    try:
+        return page.evaluate(
+            r"""
+(delta) => {
+  const items = document.querySelectorAll("[data-e2e='conversation-item']");
+  if (!items.length) return false;
+  let el = items[0], hops = 0;
+  while (el && hops < 12) {
+    if (el.scrollHeight > el.clientHeight + 10) {
+      const before = el.scrollTop;
+      el.scrollTop = before + delta;
+      return el.scrollTop > before || before + delta < el.scrollHeight;
+    }
+    el = el.parentElement; hops++;
+  }
+  return false;
+}
+""",
+            delta,
+        )
+    except Exception:
+        return False
+
+
+def _wait_conv_list_rendered(page, timeout_s=8):
+    """等会话列表渲染出至少一项（im-dialog 可见不代表列表加载完成）。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            loc = page.locator(CONVERSATION_ITEM)
+            if loc.count() > 0 and loc.first.is_visible(timeout=400):
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    return False
 
 
 def _wait_chat_input(page, timeout_ms=8000):
@@ -384,9 +443,10 @@ def _open_via_sidebar_search(page, name):
                         if t.startswith(name):
                             matched = True
                             break
-                        if t.length > 60:
+                        if len(t) > 60:
                             break
                     if matched:
+                        _harvest_item_avatar(holder, name)   # 顺手抓头像
                         btn.click()
                         page.wait_for_timeout(1500)
                         if _wait_chat_input(page, 6000) is not None:
@@ -398,6 +458,7 @@ def _open_via_sidebar_search(page, name):
         # 结果优先按会话项匹配
         item = _match_conversation_item(page, name)
         if item is not None:
+            _harvest_item_avatar(item, name)
             item.click()
             page.wait_for_timeout(1200)
             if _wait_chat_input(page, 6000) is not None:
@@ -428,6 +489,7 @@ def _find_and_open_conversation(page, name):
     hint = ""
     item = _wait_conversation_item(page, name, timeout_s=10)
     if item is not None:
+        _harvest_item_avatar(item, name)   # 顺手抓头像（发送结束统一写回配置）
         try:
             item.click()
             page.wait_for_timeout(1000)
@@ -455,52 +517,151 @@ def _shot(page, tag):
         return ""
 
 
+def _sidebar_panel_visible(page):
+    """左面板（会话列表区）是否真正可见。
+    坑：主站把 im-dialog 常驻 DOM（隐藏态），只查元素存在会误判侧栏已开。"""
+    try:
+        return page.evaluate(
+            r"""
+() => {
+  const items = document.querySelectorAll("[data-e2e='conversation-item']");
+  for (const it of items) {
+    const r = it.getBoundingClientRect();
+    if (r.width > 50 && r.height > 10) return true;
+  }
+  return false;
+}
+"""
+        )
+    except Exception:
+        return False
+
+
+def _sidebar_container_visible(page):
+    """侧栏容器是否在屏幕上显示（rect 有面积）。"""
+    try:
+        return page.evaluate(
+            r"""
+() => {
+  const dlg = document.querySelector("[data-e2e='im-dialog']");
+  if (!dlg) return false;
+  const r = dlg.getBoundingClientRect();
+  return r.width > 100 && r.height > 100;
+}
+"""
+        )
+    except Exception:
+        return False
+
+
+def _click_sidebar_back(page):
+    """侧栏停在聊天视图时点「返回」回到会话列表。点击了返回元素返回 True。"""
+    try:
+        return page.evaluate(
+            r"""
+() => {
+  const dlg = document.querySelector("[data-e2e='im-dialog']");
+  if (!dlg) return false;
+  const els = dlg.querySelectorAll("[class*='back'], [class*='Back'], [aria-label*='返回']");
+  for (const el of els) {
+    const b = el.getBoundingClientRect();
+    if (b.width > 0 && b.height > 0 && b.width < 80 && b.height < 80) {
+      el.click();
+      return true;
+    }
+  }
+  return false;
+}
+"""
+        )
+    except Exception:
+        return False
+
+
 def _open_message_center(page):
-    """打开消息中心侧栏：先直接访问 /message，侧栏没出现则回退主站点「消息」图标。"""
+    """打开消息侧栏，直到左面板（会话列表）真正可见。
+    入口按钮是开关：侧栏若已被页面自动恢复，再点一次反而会关上。
+    所以每一步都以「左面板可见」为准：容器没显示→点入口；停在聊天视图→点返回。"""
     page.goto(IM_URL, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(2500)
-    # 判定消息侧栏是否真的打开：im-dialog 容器可见（不能用主站顶部搜索框判定！）
-    if _first_visible(page, [IM_DIALOG], timeout=1500) is None:
-        _log("open_message_center: /message fallback -> homepage entry")
-        page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2000)
-        entry = _first_visible(page, MSG_ENTRY_SELECTORS, timeout=2000)
-        if entry is not None:
-            entry.click()
+    went_home = False
+    for attempt in range(4):
+        if _sidebar_panel_visible(page):
+            if attempt:
+                _log("open_message_center: panel visible at attempt %d" % attempt)
+            break
+        if _sidebar_container_visible(page):
+            # 侧栏开着但列表不可见：多半停在聊天视图，点返回
+            if not _click_sidebar_back(page):
+                _log("open_message_center: sidebar open but panel hidden, no back btn")
             page.wait_for_timeout(2000)
         else:
-            # 兜底：按可见文本「消息」点击（右上角导航）
-            try:
-                cand = page.get_by_text("消息", exact=True)
-                for i in range(min(cand.count(), 5)):
-                    item = cand.nth(i)
-                    try:
-                        if item.is_visible():
-                            item.click()
-                            page.wait_for_timeout(2000)
+            # 侧栏没显示：回主页点消息入口（/message 页没有入口按钮）
+            if not went_home:
+                went_home = True
+                _log("open_message_center: /message no sidebar -> homepage entry")
+                page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
+                          timeout=30000)
+                page.wait_for_timeout(2000)
+            entry = _first_visible(page, MSG_ENTRY_SELECTORS, timeout=1500)
+            clicked = False
+            if entry is not None:
+                try:
+                    entry.click(timeout=1500)
+                    clicked = True
+                except Exception:
+                    pass
+            if not clicked:
+                try:
+                    cand = page.get_by_text("消息", exact=True)
+                    for i in range(min(cand.count(), 5)):
+                        el = cand.nth(i)
+                        if el.is_visible():
+                            el.click()
+                            clicked = True
                             break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            if not clicked:
+                _log("open_message_center: no message entry found (attempt %d)" % attempt)
+            page.wait_for_timeout(2200)
+    else:
+        _log("open_message_center: left panel NOT visible after retries")
+    _wait_conv_list_rendered(page, timeout_s=6)
 
 
 # ---- 联系人提取 ----
 # 会话列表提取：用官方 conversation-item 锚点（2026-10 实测）
-# 会话项文本结构：昵称 / 火花数 / 时间 / 最后一条消息（抖音号在会话列表里不存在）
+# 会话项文本结构：昵称 / 火花数(如 🔥206) / 时间 / 最后一条消息（抖音号在会话列表里不存在）
 SESSIONS_JS = r"""
 () => {
   const seen = new Map();
   document.querySelectorAll("[data-e2e='conversation-item']").forEach(item => {
     try {
+      if (!item.offsetParent) return;   // 隐藏项（侧栏没真正打开时）文本会挤成一行，跳过
       const img = item.querySelector('img');
       const lines = (item.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
       if (!lines.length) return;
       const name = lines[0];
       if (!name || name.length > 40) return;
       const avatar = img ? (img.src || '') : '';
+      let spark = 0;
+      for (let i = 1; i < Math.min(lines.length, 4); i++) {
+        const ln = lines[i];
+        if (/^\d+(?:\.\d+)?\s*万?$/.test(ln)) {
+          spark = parseFloat(ln.replace('万', '')) * (ln.indexOf('万') >= 0 ? 10000 : 1) | 0;
+          break;
+        }
+        if (ln.indexOf('🔥') >= 0 || ln.indexOf('火花') >= 0) {
+          const m = ln.match(/([\d.,]+)\s*(万)?/);
+          spark = m ? (parseFloat(m[1].replace(/,/g, '')) * (m[2] ? 10000 : 1) | 0) : 1;
+          if (!spark) spark = 1;
+          break;
+        }
+      }
       const preview = lines.slice(1, 4).join(' · ').slice(0, 60);
-      if (!seen.has(name)) seen.set(name, {name: name, uid: '', avatar: avatar, preview: preview});
+      if (!seen.has(name)) seen.set(name, {name: name, uid: '', avatar: avatar,
+                                           preview: preview, spark: spark});
     } catch (e) {}
   });
   return Array.from(seen.values()).slice(0, 60);
@@ -577,7 +738,7 @@ def _extract_contacts(page):
 
 
 def _extract_sessions(page):
-    """从消息侧栏提取会话（conversation-item 锚点），失败回退旧 CONTACT_JS。"""
+    """从消息侧栏提取会话（conversation-item 锚点，含火花数），失败回退旧 CONTACT_JS。"""
     try:
         items = page.evaluate(SESSIONS_JS)
         if items:
@@ -587,38 +748,67 @@ def _extract_sessions(page):
     return _extract_contacts(page)
 
 
-def fetch_contacts(max_tries=3):
-    """打开消息中心读取会话列表。返回 (contacts, shot, err)。
-    注意：会话列表里没有抖音号，uid 需要用 enrich_uid 走主站搜索补全。"""
+def fetch_sessions(max_tries=3):
+    """打开消息中心读取全部会话（含 spark 火花数）。返回 (sessions, shot, err)。"""
     with _BROWSER_LOCK:
         shot = ""
         try:
             page = _open(headless=False)
             _open_message_center(page)
             if not has_session_cookie(_context):
-                shot = _shot(page, "contacts_nologin")
+                shot = _shot(page, "sessions_nologin")
                 return [], shot, "登录态已失效，请先扫码登录"
             page.wait_for_timeout(1500)
-            contacts = []
+            sessions = []
             for i in range(max_tries):
-                contacts = _extract_sessions(page)
-                if contacts:
+                sessions = _extract_sessions(page)
+                if sessions:
                     break
-                try:
-                    page.mouse.wheel(0, 400)
-                except Exception:
-                    pass
+                _scroll_conv_list(page, 800)   # 虚拟列表：滚动加载更多会话
                 page.wait_for_timeout(1000)
-            shot = _shot(page, "contacts")
-            _log("fetch_contacts -> %d items" % len(contacts))
-            if not contacts:
+            # 再从头滚一遍收集（有些会话滚出视口后从 DOM 卸载，分批合并）
+            merged = {s["name"]: s for s in sessions}
+            if merged:
+                page.evaluate(r"""
+() => {
+  const items = document.querySelectorAll("[data-e2e='conversation-item']");
+  if (!items.length) return;
+  let el = items[0], hops = 0;
+  while (el && hops < 12) {
+    if (el.scrollHeight > el.clientHeight + 10) { el.scrollTop = 0; return; }
+    el = el.parentElement; hops++;
+  }
+}
+""")
+                page.wait_for_timeout(600)
+                pos = 0
+                for _ in range(12):
+                    for s in _extract_sessions(page):
+                        merged.setdefault(s["name"], s)
+                    if not _scroll_conv_list(page, 400):
+                        break
+                    pos += 400
+                    page.wait_for_timeout(500)
+            sessions = list(merged.values())
+            shot = _shot(page, "sessions")
+            _log("fetch_sessions -> %d items" % len(sessions))
+            if not sessions:
                 return [], shot, "未能从消息中心提取到会话（可能还没有聊天记录，或页面改版）"
-            return contacts, shot, ""
+            return sessions, shot, ""
         except Exception as e:
-            _log("fetch_contacts error: %r" % e)
+            _log("fetch_sessions error: %r" % e)
             return [], shot, "异常: %r" % e
         finally:
             _close()
+
+
+def fetch_contacts(max_tries=3):
+    """打开消息中心读取会话列表（全量滚动收集）。返回 (contacts, shot, err)。
+    注意：会话列表里没有抖音号，uid 需要用 enrich_uid 走主站搜索补全。"""
+    sessions, shot, err = fetch_sessions(max_tries=max_tries)
+    if err and not sessions:
+        return [], shot, err
+    return sessions, shot, ""
 
 
 def search_users(kw):
@@ -827,6 +1017,8 @@ def _send_once(name, text):
         _open_message_center(page)
         if not has_session_cookie(_context):
             raise NotLoggedIn("登录态已失效，请重新扫码")
+        if not _sidebar_panel_visible(page):
+            raise SendFailed("消息侧栏未能打开（会话列表不可见），稍后用「立即发送」重试即可")
         _find_and_open_conversation(page, name)
         page.wait_for_timeout(500)
 
@@ -878,17 +1070,7 @@ def _send_once(name, text):
 
 
 def send_message(name, text):
-    """给 name 发送一条 text，失败自动重试一次（登录失效除外）。
-    返回 (ok, detail)：成功/最终失败原因。"""
+    """给 name 发送一条 text。返回 (ok, detail)。
+    失败不当场重试（2026-10-16 规则：全部跑完一遍后，失败者由「立即发送」统一补发）。"""
     with _BROWSER_LOCK:
-        ok, detail = _send_once(name, text)
-        if ok:
-            return True, detail
-        if "登录态已失效" in detail:
-            return False, detail
-        _log("send_message: retry once for %s (first fail: %s)" % (name, detail))
-        time.sleep(3)
-        ok2, detail2 = _send_once(name, text)
-        if ok2:
-            return True, "已发送（首次失败，重试成功）"
-        return False, "重试后仍失败: %s" % detail2
+        return _send_once(name, text)
