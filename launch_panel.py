@@ -99,6 +99,15 @@ if _port_open():
 
 os.environ["SPARK_AUTOPEN"] = "1"
 
+import faulthandler  # noqa: E402
 import uvicorn  # noqa: E402
 
-uvicorn.run("app.main:app", host="127.0.0.1", port=8765, log_level="warning")
+# 硬崩溃（原生段错误/访问违例）也留痕到日志，杜绝"无声死亡查不到原因"
+faulthandler.enable(_bg)
+
+try:
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8765, log_level="warning")
+finally:
+    _bg.write("==== panel exited at %s ====\n"
+              % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    _bg.flush()
