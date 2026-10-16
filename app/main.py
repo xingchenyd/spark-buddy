@@ -34,12 +34,31 @@ def _maybe_autopen():
 
 
 @asynccontextmanager
+def _heartbeat_loop(stop_event):
+    """每 5 秒写一次心跳文件（PID/版本/忙碌状态）：
+    启动器据此识别仍在运行的旧版本面板并自动替换。"""
+    import time as _t
+
+    while not stop_event.is_set():
+        try:
+            config.save_alive({
+                "pid": os.getpid(),
+                "version": config.CODE_VERSION,
+                "ts": _t.time(),
+                "busy": bool(scheduler.task_running),
+            })
+        except Exception:
+            pass
+        stop_event.wait(5)
+
+
 async def lifespan(app: FastAPI):
     global _sched_thread
     config.ensure_dirs()
     _stop.clear()
     _sched_thread = threading.Thread(target=scheduler.scheduler_loop, args=(_stop,), daemon=True)
     _sched_thread.start()
+    threading.Thread(target=_heartbeat_loop, args=(_stop,), daemon=True).start()
     _maybe_autopen()
     yield
     _stop.set()

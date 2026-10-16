@@ -413,6 +413,45 @@ def _chat_view_hint(page):
     return ""
 
 
+def _dialog_text_count(page, text):
+    """数 im-dialog 的 innerText 里出现 text 的次数。
+    比 get_by_text 抗造：emoji 被拆成多个 DOM 节点、渲染时机差异都兼容
+    （2026-10-16 许亦瑶/它叫多多实际已发送却被判失败的误报即源于此）。"""
+    try:
+        return page.evaluate(
+            r"""
+(t) => {
+  const dlg = document.querySelector("[data-e2e='im-dialog']");
+  if (!dlg) return -1;
+  const s = dlg.innerText || '';
+  return s.split(t).length - 1;
+}
+""",
+            text,
+        )
+    except Exception:
+        return -1
+
+
+def _chat_input_cleared(page):
+    """聊天输入框是否已清空（客户端接受发送后会立即清空输入框）。"""
+    try:
+        return page.evaluate(
+            r"""
+() => {
+  const boxes = document.querySelectorAll("[data-e2e='im-dialog'] div[contenteditable='true']");
+  if (!boxes.length) return false;
+  for (const b of boxes) {
+    if ((b.innerText || '').trim().length > 0) return false;
+  }
+  return true;
+}
+"""
+        )
+    except Exception:
+        return False
+
+
 def _open_via_sidebar_search(page, name):
     """在消息侧栏内部搜索并点开会话（绝不碰主站顶部搜索框）。
     结果项带「发消息」按钮时点按钮直达聊天；成功打开聊天窗返回 True。"""
@@ -1028,7 +1067,9 @@ def _send_once(name, text):
         box.click()
         page.wait_for_timeout(300)
 
-        before = page.get_by_text(text).count()
+        before = _dialog_text_count(page, text)
+        if before < 0:
+            before = page.get_by_text(text).count()
         page.keyboard.insert_text(text)
         page.wait_for_timeout(400)
         page.keyboard.press("Enter")
@@ -1041,15 +1082,22 @@ def _send_once(name, text):
             except Exception:
                 pass
 
-        # 强校验：6 秒内出现含该文本的新消息节点
+        # 强校验：12 秒内对话区 innerText 中该文本出现次数增加
+        #（昨日同文本历史气泡由 before/after 对比天然排除）
         ok = False
-        for _ in range(12):
+        for _ in range(24):
             page.wait_for_timeout(500)
-            cnt = page.get_by_text(text).count()
+            cnt = _dialog_text_count(page, text)
+            if cnt < 0:
+                cnt = page.get_by_text(text).count()
             if cnt > before:
                 ok = True
                 break
         if not ok:
+            # 输入框已清空 = 客户端已接受发送（气泡渲染/回执可能滞后）
+            if _chat_input_cleared(page):
+                _log("send_message -> %s OK (input cleared, bubble lag)" % name)
+                return True, "已发送（气泡校验超时，但输入框已清空，消息已进入发送队列）"
             raise SendFailed("发送后未检测到消息气泡（可能被风控或页面改版）")
         _log("send_message -> %s OK" % name)
         return True, "已发送"

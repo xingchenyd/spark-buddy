@@ -16,6 +16,29 @@ HISTORY_PATH = DATA / "history.jsonl"
 
 _lock = threading.Lock()
 
+# 面板代码版本：每次改动代码必须 bump，启动器据此自动替换仍在运行的旧版本面板
+CODE_VERSION = 20261016
+
+ALIVE_PATH = DATA / "panel_alive.json"
+
+
+def load_alive():
+    try:
+        with open(ALIVE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_alive(obj):
+    try:
+        tmp = str(ALIVE_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, str(ALIVE_PATH))
+    except Exception:
+        pass
+
 DEFAULT_CONFIG = {
     "send_time": "10:00",          # 每日发送时间 HH:MM
     "catch_up": True,              # 错过时间后启动面板是否补发
