@@ -18,6 +18,21 @@ _sched_thread = None
 _login_thread = None
 
 
+def _maybe_autopen():
+    """SPARK_AUTOPEN=1（由 launch_panel.py 设置）时，服务就绪后自动打开浏览器。"""
+    if os.environ.get("SPARK_AUTOPEN") != "1":
+        return
+    import webbrowser
+
+    def _open_when_ready():
+        try:
+            webbrowser.open("http://127.0.0.1:8765")
+        except Exception:
+            pass
+
+    threading.Timer(1.5, _open_when_ready).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _sched_thread
@@ -25,6 +40,7 @@ async def lifespan(app: FastAPI):
     _stop.clear()
     _sched_thread = threading.Thread(target=scheduler.scheduler_loop, args=(_stop,), daemon=True)
     _sched_thread.start()
+    _maybe_autopen()
     yield
     _stop.set()
 

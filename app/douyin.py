@@ -16,8 +16,6 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
 from . import config
 
 # 2026-10: im.douyin.com 已被抖音下线（权威 DNS NXDOMAIN）。
@@ -155,6 +153,9 @@ def _new_context(pw, headless=False, window_pos=WIN_OFFSCREEN):
 def _open(headless=False, window_pos=WIN_OFFSCREEN):
     """在持有 _BROWSER_LOCK 的前提下打开持久化浏览器。"""
     global _playwright, _context, _page
+    # playwright 导入较重（冷启动可占数秒），延迟到真正需要浏览器时再加载
+    from playwright.sync_api import sync_playwright
+
     _playwright = sync_playwright().start()
     _context = _new_context(_playwright, headless=headless, window_pos=window_pos)
     _page = _context.pages[0] if _context.pages else _context.new_page()
@@ -865,9 +866,11 @@ def _send_once(name, text):
     except SendFailed as e:
         _log("send_message -> %s FAIL: %s" % (name, e))
         return False, str(e)
-    except PWTimeout as e:
-        return False, "页面加载超时: %s" % e
     except Exception as e:
+        from playwright.sync_api import TimeoutError as PWTimeout
+
+        if isinstance(e, PWTimeout):
+            return False, "页面加载超时: %s" % e
         _log("send_message error: %r" % e)
         return False, "异常: %r" % e
     finally:

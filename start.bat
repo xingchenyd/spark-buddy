@@ -1,9 +1,12 @@
 @echo off
 rem ============================================================
 rem  SparkBuddy - One-click launcher (silent)
-rem  Runs the panel hidden in background (pythonw, no window),
-rem  waits until the port is really up, opens the browser, then
-rem  this launcher window closes by itself.
+rem  Preferred path: the panel process is created via WMI, so it
+rem  is fully detached from this window - closing (or losing)
+rem  this window can never kill the panel. If WMI is blocked,
+rem  we fall back to a direct launch.
+rem  The panel opens your browser by itself when it is ready;
+rem  cold start after reboot can take up to about one minute.
 rem  To stop the panel: click "停止面板" in the panel settings.
 rem ============================================================
 setlocal
@@ -12,32 +15,18 @@ cd /d "%~dp0"
 set PYW=%~dp0.venv\Scripts\pythonw.exe
 if not exist "%PYW%" (
     echo [ERROR] venv pythonw not found: %PYW%
+    echo Please run install.bat first.
     pause
     exit /b 1
 )
 
-echo Starting SparkBuddy panel in background...
-rem pythonw = no console window; start = don't block this launcher.
-rem If the panel is already running, this new instance fails to
-rem bind port 8765 and exits silently - harmless.
-start "" "%PYW%" -m uvicorn app.main:app --host 127.0.0.1 --port 8765
-
-echo Waiting for the panel to come up (first start can be slow)...
-set /a TRIES=0
-:waitup
-set /a TRIES+=1
-if %TRIES% GTR 40 (
-    echo [ERROR] Panel did not start within 40 seconds.
-    echo Possible causes: antivirus blocked python, or install.bat was not run.
-    pause
-    exit /b 1
-)
-powershell -NoProfile -Command "try{$c=New-Object Net.Sockets.TcpClient;$c.Connect('127.0.0.1',8765);$c.Close();exit 0}catch{exit 1}" >nul 2>&1
+echo Starting SparkBuddy in background...
+powershell -NoProfile -Command "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='\"%PYW%\" \"%~dp0launch_panel.py\"';CurrentDirectory='%~dp0'}; if($r.ReturnValue -ne 0){exit 1}" >nul 2>&1
 if errorlevel 1 (
-    timeout /t 1 >nul
-    goto waitup
+    echo WMI launch unavailable - using fallback...
+    start "" "%PYW%" "%~dp0launch_panel.py"
 )
-
-echo Panel is up - opening browser...
-start "" http://127.0.0.1:8765
+echo Done. Your browser will open automatically when the panel is ready.
+echo (After a reboot this can take up to about one minute - just wait.)
+timeout /t 3 >nul
 exit /b 0
