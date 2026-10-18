@@ -17,7 +17,7 @@ HISTORY_PATH = DATA / "history.jsonl"
 _lock = threading.Lock()
 
 # 面板代码版本：每次改动代码必须 bump，启动器据此自动替换仍在运行的旧版本面板
-CODE_VERSION = 20261016
+CODE_VERSION = 20261018
 
 ALIVE_PATH = DATA / "panel_alive.json"
 

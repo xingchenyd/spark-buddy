@@ -252,7 +252,7 @@ def check_logged_in():
     with _BROWSER_LOCK:
         try:
             page = _open(headless=True)
-            page.goto(IM_URL, wait_until="domcontentloaded", timeout=30000)
+            _goto_retry(page, IM_URL, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2500)
             ok = has_session_cookie(_context)
             _log("check_logged_in -> %s" % ok)
@@ -452,6 +452,23 @@ def _chat_input_cleared(page):
         return False
 
 
+def _dialog_tail_hint(page):
+    """失败诊断：抓 im-dialog 的 innerText 尾部（空格归一），便于事后还原页面状态。"""
+    try:
+        return page.evaluate(
+            r"""
+() => {
+  const dlg = document.querySelector("[data-e2e='im-dialog']");
+  if (!dlg) return '';
+  const t = (dlg.innerText || '').replace(/\s+/g, ' ').trim();
+  return t.slice(-90);
+}
+"""
+        )
+    except Exception:
+        return ""
+
+
 def _open_via_sidebar_search(page, name):
     """在消息侧栏内部搜索并点开会话（绝不碰主站顶部搜索框）。
     结果项带「发消息」按钮时点按钮直达聊天；成功打开聊天窗返回 True。"""
@@ -546,6 +563,19 @@ def _find_and_open_conversation(page, name):
     raise SendFailed(msg)
 
 
+def _goto_retry(page, url, attempts=3, **kw):
+    """goto 带瞬时网络错误重试（DNS 解析失败/超时等，2026-10-18 批量首条实测发生过）。"""
+    last = None
+    for i in range(attempts):
+        try:
+            return page.goto(url, **kw)
+        except Exception as e:
+            last = e
+            _log("goto retry %d/%d for %s: %r" % (i + 1, attempts, url[:44], e))
+            time.sleep(random.uniform(2.0, 4.0))
+    raise last
+
+
 def _shot(page, tag):
     name = "%s_%s.png" % (datetime.now().strftime("%Y%m%d_%H%M%S"), tag)
     path = config.SHOTS / name
@@ -621,7 +651,7 @@ def _open_message_center(page):
     """打开消息侧栏，直到左面板（会话列表）真正可见。
     入口按钮是开关：侧栏若已被页面自动恢复，再点一次反而会关上。
     所以每一步都以「左面板可见」为准：容器没显示→点入口；停在聊天视图→点返回。"""
-    page.goto(IM_URL, wait_until="domcontentloaded", timeout=30000)
+    _goto_retry(page, IM_URL, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(2500)
     went_home = False
     for attempt in range(4):
@@ -639,8 +669,8 @@ def _open_message_center(page):
             if not went_home:
                 went_home = True
                 _log("open_message_center: /message no sidebar -> homepage entry")
-                page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
-                          timeout=30000)
+                _goto_retry(page, "https://www.douyin.com/",
+                            wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(2000)
             entry = _first_visible(page, MSG_ENTRY_SELECTORS, timeout=1500)
             clicked = False
@@ -859,8 +889,8 @@ def search_users(kw):
         shot = ""
         try:
             page = _open(headless=False)
-            page.goto("https://www.douyin.com/search/%s?type=user" % quote(kw),
-                      wait_until="domcontentloaded", timeout=30000)
+            _goto_retry(page, "https://www.douyin.com/search/%s?type=user" % quote(kw),
+                        wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3500)
             if not has_session_cookie(_context):
                 shot = _shot(page, "search_nologin")
@@ -929,8 +959,8 @@ def _search_uid_once(page, name, avatar=""):
     2) 用户 tab 精确匹配卡片（昵称精确，或头像 ID 与会话头像一致）→ 点进主页读抖音号。"""
     # 路径 1：综合页名片
     try:
-        page.goto("https://www.douyin.com/search/%s" % quote(name),
-                  wait_until="domcontentloaded", timeout=30000)
+        _goto_retry(page, "https://www.douyin.com/search/%s" % quote(name),
+                    wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(4000)
         cards = page.evaluate(SEARCH_UID_JS)
         for c in cards:
@@ -940,8 +970,8 @@ def _search_uid_once(page, name, avatar=""):
         _log("enrich card path error: %r" % e)
     # 路径 2：用户 tab → 主页
     try:
-        page.goto("https://www.douyin.com/search/%s?type=user" % quote(name),
-                  wait_until="domcontentloaded", timeout=30000)
+        _goto_retry(page, "https://www.douyin.com/search/%s?type=user" % quote(name),
+                    wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3800)
         contacts = _extract_contacts(page)
         target_tokens = _avatar_tokens(avatar)
@@ -1019,8 +1049,8 @@ def enrich_uid(items):
         try:
             page = _open(headless=False)
             if not has_session_cookie(_context):
-                page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
-                          timeout=30000)
+                _goto_retry(page, "https://www.douyin.com/", wait_until="domcontentloaded",
+                            timeout=30000)
                 page.wait_for_timeout(2000)
             for i, (name, avatar) in enumerate(pairs):
                 try:
@@ -1082,10 +1112,14 @@ def _send_once(name, text):
             except Exception:
                 pass
 
-        # 强校验：12 秒内对话区 innerText 中该文本出现次数增加
-        #（昨日同文本历史气泡由 before/after 对比天然排除）
+        # 强校验：15 秒内任一信号确认发送成功
+        # 信号1（最强）：对话区 innerText 中该文本出现次数增加（before/after 排除同文本历史）
+        # 信号2（兜底）：输入框被清空且保持清空 = 客户端已接受发送（气泡渲染/回执可能滞后，
+        #              2026-10-17 贵宾小吴实际已送达却被判失败即此类）
         ok = False
-        for _ in range(24):
+        input_cleared = False
+        cleared_streak = 0
+        for _ in range(30):
             page.wait_for_timeout(500)
             cnt = _dialog_text_count(page, text)
             if cnt < 0:
@@ -1093,12 +1127,19 @@ def _send_once(name, text):
             if cnt > before:
                 ok = True
                 break
-        if not ok:
-            # 输入框已清空 = 客户端已接受发送（气泡渲染/回执可能滞后）
             if _chat_input_cleared(page):
-                _log("send_message -> %s OK (input cleared, bubble lag)" % name)
-                return True, "已发送（气泡校验超时，但输入框已清空，消息已进入发送队列）"
-            raise SendFailed("发送后未检测到消息气泡（可能被风控或页面改版）")
+                cleared_streak += 1
+                if cleared_streak >= 2:
+                    input_cleared = True
+            else:
+                cleared_streak = 0
+        if not ok and input_cleared:
+            _log("send_message -> %s OK (input cleared, bubble lag)" % name)
+            return True, "已发送（气泡校验超时，但输入框已清空，消息已进入发送队列）"
+        if not ok:
+            tail = _dialog_tail_hint(page)
+            raise SendFailed("发送后未检测到消息气泡（可能被风控或页面改版）"
+                             + ("；页面尾部内容: %s" % tail if tail else ""))
         _log("send_message -> %s OK" % name)
         return True, "已发送"
     except NotLoggedIn as e:
