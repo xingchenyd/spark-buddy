@@ -563,8 +563,10 @@ def _find_and_open_conversation(page, name):
     raise SendFailed(msg)
 
 
-def _goto_retry(page, url, attempts=3, **kw):
-    """goto 带瞬时网络错误重试（DNS 解析失败/超时等，2026-10-18 批量首条实测发生过）。"""
+def _goto_retry(page, url, attempts=5, **kw):
+    """goto 带瞬时网络错误重试（DNS 解析失败/超时等）。
+    2026-10-19 加强：attempts 3→5、退避 2-4s→3-6s——机器刚唤醒/网络切换时
+    DNS 恢复可能要 20s+，旧参数总窗口 ~8s 不够用。"""
     last = None
     for i in range(attempts):
         try:
@@ -572,7 +574,8 @@ def _goto_retry(page, url, attempts=3, **kw):
         except Exception as e:
             last = e
             _log("goto retry %d/%d for %s: %r" % (i + 1, attempts, url[:44], e))
-            time.sleep(random.uniform(2.0, 4.0))
+            if i < attempts - 1:
+                time.sleep(random.uniform(3.0, 6.0))
     raise last
 
 
@@ -624,17 +627,32 @@ def _sidebar_container_visible(page):
 
 
 def _click_sidebar_back(page):
-    """侧栏停在聊天视图时点「返回」回到会话列表。点击了返回元素返回 True。"""
+    """侧栏停在聊天视图时点「返回」回到会话列表。点击了返回元素返回 True。
+    2026-10-19：back 类名找不到时，兜底点 im-dialog 左上角的无文本小元素
+    （返回按钮几乎总在左上角；当天日志 4 连失败全是 no back btn）。"""
     try:
         return page.evaluate(
             r"""
 () => {
   const dlg = document.querySelector("[data-e2e='im-dialog']");
   if (!dlg) return false;
-  const els = dlg.querySelectorAll("[class*='back'], [class*='Back'], [aria-label*='返回']");
+  const els = dlg.querySelectorAll("[class*='back'], [class*='Back'], [aria-label*='返回'], [title*='返回'], [data-e2e*='back']");
   for (const el of els) {
     const b = el.getBoundingClientRect();
     if (b.width > 0 && b.height > 0 && b.width < 80 && b.height < 80) {
+      el.click();
+      return true;
+    }
+  }
+  // 兜底：左上角 110x60 区域内的小图标元素（返回按钮常规位置）
+  const r = dlg.getBoundingClientRect();
+  const cand = dlg.querySelectorAll('*');
+  for (const el of cand) {
+    const b = el.getBoundingClientRect();
+    if (b.width > 0 && b.height > 0 && b.width <= 40 && b.height <= 40
+        && b.left >= r.left - 2 && b.left <= r.left + 110
+        && b.top >= r.top - 2 && b.top <= r.top + 60
+        && !(el.innerText || '').trim()) {
       el.click();
       return true;
     }
@@ -647,55 +665,81 @@ def _click_sidebar_back(page):
         return False
 
 
+def _goto_homepage(page):
+    _goto_retry(page, "https://www.douyin.com/",
+                wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(2000)
+
+
+def _click_message_entry(page):
+    """在主页点消息入口按钮。返回是否点到了。"""
+    entry = _first_visible(page, MSG_ENTRY_SELECTORS, timeout=1500)
+    if entry is not None:
+        try:
+            entry.click(timeout=1500)
+            return True
+        except Exception:
+            pass
+    try:
+        cand = page.get_by_text("消息", exact=True)
+        for i in range(min(cand.count(), 5)):
+            el = cand.nth(i)
+            if el.is_visible():
+                el.click()
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _open_message_center(page):
     """打开消息侧栏，直到左面板（会话列表）真正可见。
     入口按钮是开关：侧栏若已被页面自动恢复，再点一次反而会关上。
-    所以每一步都以「左面板可见」为准：容器没显示→点入口；停在聊天视图→点返回。"""
+    所以每一步都以「左面板可见」为准：容器没显示→点入口；停在聊天视图→点返回。
+
+    2026-10-19 恢复阶梯（当天 10:06-10:10 四连失败复盘：
+    「容器开着但左面板藏、又找不到返回按钮」的状态下旧逻辑只会干等 4 轮然后放弃）：
+      - 聊天视图卡死连续 2 次 → goto /message 整页重载（清掉 SPA 卡死态）；
+      - 重载后仍卡 → 回主页把入口开关完整切换一遍（关掉再开）；
+      - 全部失败 → 截图留证（data/screenshots/），方便事后诊断。"""
     _goto_retry(page, IM_URL, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(2500)
-    went_home = False
-    for attempt in range(4):
+    stuck_chat_view = 0
+    for attempt in range(5):
         if _sidebar_panel_visible(page):
             if attempt:
                 _log("open_message_center: panel visible at attempt %d" % attempt)
             break
         if _sidebar_container_visible(page):
-            # 侧栏开着但列表不可见：多半停在聊天视图，点返回
+            stuck_chat_view += 1
+            if stuck_chat_view >= 2:
+                # 返回按钮连续找不到：别干等，整页重载从头来
+                _log("open_message_center: chat-view stuck x%d -> reload /message (attempt %d)"
+                     % (stuck_chat_view, attempt))
+                _goto_retry(page, IM_URL, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                if _sidebar_container_visible(page) and not _sidebar_panel_visible(page):
+                    # 重载后仍卡在聊天视图：回主页开关切换（入口是 toggle）
+                    _log("open_message_center: still stuck -> entry toggle reset (attempt %d)" % attempt)
+                    _goto_homepage(page)
+                    if _click_message_entry(page):
+                        page.wait_for_timeout(1500)
+                        _click_message_entry(page)
+                    page.wait_for_timeout(2000)
+                continue
+            # 第一次：停在聊天视图，先试点「返回」
             if not _click_sidebar_back(page):
                 _log("open_message_center: sidebar open but panel hidden, no back btn")
             page.wait_for_timeout(2000)
         else:
-            # 侧栏没显示：回主页点消息入口（/message 页没有入口按钮）
-            if not went_home:
-                went_home = True
-                _log("open_message_center: /message no sidebar -> homepage entry")
-                _goto_retry(page, "https://www.douyin.com/",
-                            wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
-            entry = _first_visible(page, MSG_ENTRY_SELECTORS, timeout=1500)
-            clicked = False
-            if entry is not None:
-                try:
-                    entry.click(timeout=1500)
-                    clicked = True
-                except Exception:
-                    pass
-            if not clicked:
-                try:
-                    cand = page.get_by_text("消息", exact=True)
-                    for i in range(min(cand.count(), 5)):
-                        el = cand.nth(i)
-                        if el.is_visible():
-                            el.click()
-                            clicked = True
-                            break
-                except Exception:
-                    pass
-            if not clicked:
+            # 侧栏整个没显示：回主页点消息入口（/message 页没有入口按钮）
+            _goto_homepage(page)
+            if not _click_message_entry(page):
                 _log("open_message_center: no message entry found (attempt %d)" % attempt)
             page.wait_for_timeout(2200)
     else:
         _log("open_message_center: left panel NOT visible after retries")
+        _shot(page, "nosidebar")
     _wait_conv_list_rendered(page, timeout_s=6)
 
 
@@ -1087,6 +1131,11 @@ def _send_once(name, text):
         if not has_session_cookie(_context):
             raise NotLoggedIn("登录态已失效，请重新扫码")
         if not _sidebar_panel_visible(page):
+            # 2026-10-19：一次没打开不再直接失败——带重载兜底再开一次
+            _log("send_once: sidebar not visible -> one more open attempt (reload ladder)")
+            _open_message_center(page)
+        if not _sidebar_panel_visible(page):
+            _shot(page, "nosidebar")
             raise SendFailed("消息侧栏未能打开（会话列表不可见），稍后用「立即发送」重试即可")
         _find_and_open_conversation(page, name)
         page.wait_for_timeout(500)

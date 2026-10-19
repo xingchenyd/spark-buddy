@@ -33,20 +33,90 @@ def _maybe_autopen():
     threading.Timer(1.5, _open_when_ready).start()
 
 
-@asynccontextmanager
-def _heartbeat_loop(stop_event):
-    """每 5 秒写一次心跳文件（PID/版本/忙碌状态）：
-    启动器据此识别仍在运行的旧版本面板并自动替换。"""
-    import time as _t
+def _plog(msg):
+    """面板级事件写入 app.log（与 [task]/[douyin] 同格式，前缀 [panel]）。"""
+    try:
+        with open(config.LOGS / "app.log", "a", encoding="utf-8") as f:
+            f.write("[%s] [panel] %s\n"
+                    % (datetime.now().strftime("%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
 
+
+_disk_ver_cache = (0.0, None)
+
+
+def _disk_code_version():
+    """重读磁盘上 config.py 的 CODE_VERSION。
+    进程内存中的值不会随文件更新而变——这正是 2026-10-19 事故根因：
+    10-17 启动的旧面板一直驻留到 10-19，两天的批次全跑的旧代码。"""
+    import re
+    global _disk_ver_cache
+    now = time.time()
+    if now - _disk_ver_cache[0] < 30:
+        return _disk_ver_cache[1]
+    try:
+        with open(config.BASE / "app" / "config.py", encoding="utf-8") as f:
+            m = re.search(r"CODE_VERSION\s*=\s*(\d+)", f.read())
+        ver = int(m.group(1)) if m else None
+    except Exception:
+        ver = None
+    _disk_ver_cache = (now, ver)
+    return ver
+
+
+def _spawn_replacement():
+    """用 WMI 拉起新版面板（与桌面快捷方式 start.bat 完全同一条路径，脱离本进程树）。
+    新面板启动后读心跳发现旧版本，会优雅关闭本进程，完成无人值守热更新。"""
+    import subprocess
+    pyw = config.BASE / ".venv" / "Scripts" / "pythonw.exe"
+    script = config.BASE / "launch_panel.py"
+    if not (os.path.exists(pyw) and os.path.exists(script)):
+        _plog("hot-restart: launcher files missing -> skip")
+        return False
+    cmdline = '"%s" "%s"' % (pyw, script)
+    ps = ("$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+          "-Arguments @{CommandLine='%s';CurrentDirectory='%s'}; "
+          "if($r.ReturnValue -ne 0){exit 1}" % (cmdline, config.BASE))
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command", ps],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, close_fds=True)
+        return True
+    except Exception as e:
+        _plog("hot-restart: spawn failed: %r" % e)
+        return False
+
+
+def _heartbeat_loop(stop_event):
+    """每 5 秒写一次心跳文件（PID/版本/忙碌状态）：启动器据此识别旧版本面板。
+    2026-10-19 起兼任热更新哨兵：发现磁盘代码比本进程新且空闲时，
+    自动拉起新版面板完成替换——用户不再需要手动双击快捷方式让新代码生效。"""
+    import time as _t
+    next_stale_check = 0.0
+    last_spawn = 0.0
     while not stop_event.is_set():
         try:
+            busy = bool(scheduler.task_running) or (
+                _login_thread is not None and _login_thread.is_alive())
             config.save_alive({
                 "pid": os.getpid(),
                 "version": config.CODE_VERSION,
                 "ts": _t.time(),
-                "busy": bool(scheduler.task_running),
+                "busy": busy,
             })
+            now = _t.time()
+            if now >= next_stale_check:
+                next_stale_check = now + 60
+                disk = _disk_code_version()
+                if (disk and disk > config.CODE_VERSION and not busy
+                        and now - last_spawn >= 300):
+                    _plog("hot-restart: disk code v%s > running v%s -> spawn replacement"
+                          % (disk, config.CODE_VERSION))
+                    if _spawn_replacement():
+                        last_spawn = now
         except Exception:
             pass
         stop_event.wait(5)
