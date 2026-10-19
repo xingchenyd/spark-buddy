@@ -66,28 +66,55 @@ def _disk_code_version():
 
 
 def _spawn_replacement():
-    """用 WMI 拉起新版面板（与桌面快捷方式 start.bat 完全同一条路径，脱离本进程树）。
-    新面板启动后读心跳发现旧版本，会优雅关闭本进程，完成无人值守热更新。"""
-    import subprocess
+    """拉起新版面板完成热替换。优先 ShellExecuteW（同步返回码 >32 可即时校验，
+    避免再犯“派发了就当成功”的错——2026-10-19 下午实测：Popen 派发的
+    PowerShell 引号被转义层吞掉、进程秒退，面板毫不知情，热更新静默失效 1 小时）。
+    失败再退回 WMI（与桌面快捷方式 start.bat 同路径）。
+    启动后 120s 核验一次心跳版本是否翻转，未翻转必留日志。"""
     pyw = config.BASE / ".venv" / "Scripts" / "pythonw.exe"
     script = config.BASE / "launch_panel.py"
     if not (os.path.exists(pyw) and os.path.exists(script)):
         _plog("hot-restart: launcher files missing -> skip")
         return False
-    cmdline = '"%s" "%s"' % (pyw, script)
-    ps = ("$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-          "-Arguments @{CommandLine='%s';CurrentDirectory='%s'}; "
-          "if($r.ReturnValue -ne 0){exit 1}" % (cmdline, config.BASE))
+    ok = False
     try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", ps],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, close_fds=True)
-        return True
+        import ctypes
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "open", str(pyw), '"%s"' % str(script), str(config.BASE), 0)
+        ok = ret > 32
+        _plog("hot-restart: ShellExecuteW -> %s (%s)"
+              % (ret, "ok" if ok else "FAILED"))
     except Exception as e:
-        _plog("hot-restart: spawn failed: %r" % e)
-        return False
+        _plog("hot-restart: ShellExecuteW error: %r" % e)
+    if not ok:
+        try:
+            import subprocess
+            cmdline = '"%s" "%s"' % (pyw, script)
+            ps = ("$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+                  "-Arguments @{CommandLine='%s';CurrentDirectory='%s'}; "
+                  "if($r.ReturnValue -ne 0){exit 1}" % (cmdline, config.BASE))
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-Command", ps],
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, close_fds=True)
+            ok = True
+            _plog("hot-restart: WMI spawn dispatched (unverified)")
+        except Exception as e:
+            _plog("hot-restart: WMI spawn failed: %r" % e)
+            return False
+    # 120s 后核验：心跳仍是本版本 => 替换没生效（替换成功时本进程已退出，不会走到这）
+    def _verify():
+        try:
+            time.sleep(120)
+            hb = config.load_alive()
+            if hb.get("version") == config.CODE_VERSION:
+                _plog("hot-restart: replacement did NOT take effect within 120s "
+                      "(still v%s)" % config.CODE_VERSION)
+        except Exception:
+            pass
+    threading.Thread(target=_verify, daemon=True).start()
+    return True
 
 
 def _heartbeat_loop(stop_event):
@@ -112,7 +139,7 @@ def _heartbeat_loop(stop_event):
                 next_stale_check = now + 60
                 disk = _disk_code_version()
                 if (disk and disk > config.CODE_VERSION and not busy
-                        and now - last_spawn >= 300):
+                        and now - last_spawn >= 180):
                     _plog("hot-restart: disk code v%s > running v%s -> spawn replacement"
                           % (disk, config.CODE_VERSION))
                     if _spawn_replacement():
