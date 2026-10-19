@@ -579,7 +579,30 @@ def _goto_retry(page, url, attempts=5, **kw):
     raise last
 
 
+def purge_old_shots(max_age_h=24):
+    """清理截图目录：只保留近一天的截图，更早的自动删除（2026-10-19 用户要求，
+    截图只用于失败瞬间的短期诊断，没必要长期占磁盘）。
+    在每次截图时与面板启动时各调用一次。"""
+    try:
+        cutoff = time.time() - max_age_h * 3600
+        n = 0
+        if config.SHOTS.exists():
+            for f in config.SHOTS.iterdir():
+                try:
+                    if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg') \
+                            and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        n += 1
+                except Exception:
+                    pass
+        if n:
+            _log("purged %d screenshot(s) older than %dh" % (n, max_age_h))
+    except Exception:
+        pass
+
+
 def _shot(page, tag):
+    purge_old_shots()
     name = "%s_%s.png" % (datetime.now().strftime("%Y%m%d_%H%M%S"), tag)
     path = config.SHOTS / name
     try:
@@ -628,8 +651,8 @@ def _sidebar_container_visible(page):
 
 def _click_sidebar_back(page):
     """侧栏停在聊天视图时点「返回」回到会话列表。点击了返回元素返回 True。
-    2026-10-19：back 类名找不到时，兜底点 im-dialog 左上角的无文本小元素
-    （返回按钮几乎总在左上角；当天日志 4 连失败全是 no back btn）。"""
+    （2026-10-19 下午：撤掉左上角图标启发式——404/坏页面上乱点有误关侧栏
+    的风险；实测该状态绝大多数是「列表异步加载中」，耐心等待即可。）"""
     try:
         return page.evaluate(
             r"""
@@ -640,19 +663,6 @@ def _click_sidebar_back(page):
   for (const el of els) {
     const b = el.getBoundingClientRect();
     if (b.width > 0 && b.height > 0 && b.width < 80 && b.height < 80) {
-      el.click();
-      return true;
-    }
-  }
-  // 兜底：左上角 110x60 区域内的小图标元素（返回按钮常规位置）
-  const r = dlg.getBoundingClientRect();
-  const cand = dlg.querySelectorAll('*');
-  for (const el of cand) {
-    const b = el.getBoundingClientRect();
-    if (b.width > 0 && b.height > 0 && b.width <= 40 && b.height <= 40
-        && b.left >= r.left - 2 && b.left <= r.left + 110
-        && b.top >= r.top - 2 && b.top <= r.top + 60
-        && !(el.innerText || '').trim()) {
       el.click();
       return true;
     }
@@ -692,53 +702,81 @@ def _click_message_entry(page):
     return False
 
 
-def _open_message_center(page):
-    """打开消息侧栏，直到左面板（会话列表）真正可见。
-    入口按钮是开关：侧栏若已被页面自动恢复，再点一次反而会关上。
-    所以每一步都以「左面板可见」为准：容器没显示→点入口；停在聊天视图→点返回。
+def _page_is_404(page):
+    """抖音 /message 路由会间歇性 404（「页面不见啦」截图实锤，2026-10-19）。
+    404 页上侧栏永远打不开，检测到就该立刻回首页走入口。"""
+    try:
+        return page.get_by_text("页面不见啦").count() > 0
+    except Exception:
+        return False
 
-    2026-10-19 恢复阶梯（当天 10:06-10:10 四连失败复盘：
-    「容器开着但左面板藏、又找不到返回按钮」的状态下旧逻辑只会干等 4 轮然后放弃）：
-      - 聊天视图卡死连续 2 次 → goto /message 整页重载（清掉 SPA 卡死态）；
-      - 重载后仍卡 → 回主页把入口开关完整切换一遍（关掉再开）；
-      - 全部失败 → 截图留证（data/screenshots/），方便事后诊断。"""
-    _goto_retry(page, IM_URL, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(2500)
-    stuck_chat_view = 0
-    for attempt in range(5):
+
+def _wait_sidebar_panel(page, timeout_s, poll=1.5):
+    """耐心等左面板出现（会话列表是异步慢加载，成功案例 6-14s 自愈）。
+    等待期间绝不 reload/点击——任何打扰都会重置加载进度。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
         if _sidebar_panel_visible(page):
-            if attempt:
-                _log("open_message_center: panel visible at attempt %d" % attempt)
-            break
-        if _sidebar_container_visible(page):
-            stuck_chat_view += 1
-            if stuck_chat_view >= 2:
-                # 返回按钮连续找不到：别干等，整页重载从头来
-                _log("open_message_center: chat-view stuck x%d -> reload /message (attempt %d)"
-                     % (stuck_chat_view, attempt))
-                _goto_retry(page, IM_URL, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
-                if _sidebar_container_visible(page) and not _sidebar_panel_visible(page):
-                    # 重载后仍卡在聊天视图：回主页开关切换（入口是 toggle）
-                    _log("open_message_center: still stuck -> entry toggle reset (attempt %d)" % attempt)
-                    _goto_homepage(page)
-                    if _click_message_entry(page):
-                        page.wait_for_timeout(1500)
-                        _click_message_entry(page)
-                    page.wait_for_timeout(2000)
-                continue
-            # 第一次：停在聊天视图，先试点「返回」
-            if not _click_sidebar_back(page):
-                _log("open_message_center: sidebar open but panel hidden, no back btn")
+            return True
+        page.wait_for_timeout(int(poll * 1000))
+    return _sidebar_panel_visible(page)
+
+
+def _open_message_center(page, budget_s=150):
+    """打开消息侧栏，直到左面板（会话列表）真正可见。
+
+    2026-10-19 下午复盘（失败瞬间截图实锤）——「侧栏打不开」反复出现的根源：
+    抖音 /message 路由**间歇性 404**（「页面不见啦」页），此前的流程先去
+    /message、失败后还反复 reload /message，等于一次次撞 404。另外会话
+    列表是异步慢加载（成功案例在判定放弃后 6-14s 内自行渲染出来）。
+
+    新策略：
+      1. 一律从首页开始点消息入口（首页路径被截图证明 100% 可靠）；
+      2. 见 404 立即回首页重来，绝不重载 /message；
+      3. 容器已开但列表未渲染 → 先试点返回，然后耐心等 ≤30s，不打扰；
+      4. 仍不成 → 重载首页再点入口（最多 2 次）；总预算 budget_s 秒
+         （默认 150），超时截图留证。budget_s 参数便于测试注入。"""
+    purge_old_shots()
+    deadline = time.time() + budget_s
+    _goto_retry(page, "https://www.douyin.com/",
+                wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(2500)
+    reloads = 0
+    while time.time() < deadline:
+        if _page_is_404(page):
+            _log("open_message_center: douyin 404 page -> back to homepage")
+            _goto_retry(page, "https://www.douyin.com/",
+                        wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
-        else:
-            # 侧栏整个没显示：回主页点消息入口（/message 页没有入口按钮）
-            _goto_homepage(page)
-            if not _click_message_entry(page):
-                _log("open_message_center: no message entry found (attempt %d)" % attempt)
-            page.wait_for_timeout(2200)
-    else:
-        _log("open_message_center: left panel NOT visible after retries")
+            continue
+        if _sidebar_panel_visible(page):
+            if reloads:
+                _log("open_message_center: panel visible (after %d reload(s))" % reloads)
+            break
+        if not _sidebar_container_visible(page):
+            # 侧栏没显示：点一次消息入口，点开后耐心等列表渲染
+            _log("open_message_center: clicking message entry")
+            if _click_message_entry(page):
+                if _wait_sidebar_panel(page, 30):
+                    break
+            else:
+                _log("open_message_center: no message entry found")
+                page.wait_for_timeout(1500)
+            continue
+        # 容器开着但列表没渲染：先试点返回（万一停在聊天视图），再耐心等
+        _click_sidebar_back(page)
+        _log("open_message_center: sidebar open, waiting for list render (<=30s)")
+        if _wait_sidebar_panel(page, 30):
+            break
+        if reloads >= 2:
+            break
+        reloads += 1
+        _log("open_message_center: list not rendered -> reload homepage (#%d)" % reloads)
+        _goto_retry(page, "https://www.douyin.com/",
+                    wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2500)
+    if not _sidebar_panel_visible(page):
+        _log("open_message_center: left panel NOT visible (gave up)")
         _shot(page, "nosidebar")
     _wait_conv_list_rendered(page, timeout_s=6)
 

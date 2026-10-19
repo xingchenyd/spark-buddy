@@ -125,6 +125,7 @@ def _heartbeat_loop(stop_event):
 async def lifespan(app: FastAPI):
     global _sched_thread
     config.ensure_dirs()
+    douyin.purge_old_shots()   # 启动即清理：截图只保留近一天（2026-10-19 用户要求）
     _stop.clear()
     _sched_thread = threading.Thread(target=scheduler.scheduler_loop, args=(_stop,), daemon=True)
     _sched_thread.start()
