@@ -179,20 +179,26 @@ def status():
     cfg = config.load_config()
     st = config.load_state()
     today = _today()
-    ok = fail = 0
+    # 按目标取当天「最新一条」记录的状态（read_history 按时间正序返回，后写覆盖）。
+    # 2026-10-20 修复：此前把所有条目简单累加，补发成功/修正后旧 FAIL 条目仍在，
+    # 顶部失败人数只加不减。
+    enabled_names = {t.get("name", "") for t in cfg.get("targets", []) if t.get("enabled", True)}
+    latest = {}
     for e in config.read_history(500):
         if e.get("time", "").startswith(today):
-            if e.get("ok"):
-                ok += 1
-            else:
-                fail += 1
+            name = e.get("name", "")
+            if name in enabled_names:
+                latest[name] = bool(e.get("ok"))
+    ok = sum(1 for v in latest.values() if v)
+    fail = len(latest) - ok
+    fail_names = [n for n, v in latest.items() if not v]
     enabled = [t for t in cfg.get("targets", []) if t.get("enabled", True)]
     return {
         "nickname": st.get("nickname", ""),
         "login_ok": bool(st.get("login_ok")),
         "login_browser_open": bool(_login_thread and _login_thread.is_alive()),
         "task_running": scheduler.task_running,
-        "today": {"total": len(enabled), "ok": ok, "fail": fail},
+        "today": {"total": len(enabled), "ok": ok, "fail": fail, "fail_names": fail_names},
         "targets_enabled": len(enabled),
         "targets_total": len(cfg.get("targets", [])),
         "next": scheduler.next_run_info(),
@@ -272,6 +278,7 @@ def set_config(cfg: dict):
             "uid": uid,
             "avatar": str(t.get("avatar", ""))[:500],
             "enabled": bool(t.get("enabled", True)),
+            "group": bool(t.get("group", False)),   # 群聊：无需抖音号，前端标注「群聊」
         })
     clean["targets"] = targets
     clean["message"] = str(cfg.get("message", "")).strip() or "✨今日火花+1"
@@ -331,6 +338,7 @@ def contacts_import_spark():
             "uid": str(c.get("uid", "")),
             "avatar": str(c.get("avatar", "")),
             "enabled": True,
+            "group": bool(c.get("group")),
         })
         existing.add(key)
         existing.add("name:" + name)
@@ -363,21 +371,38 @@ def contacts_enrich():
     if scheduler.task_running or (_login_thread and _login_thread.is_alive()):
         return JSONResponse({"ok": False, "msg": "浏览器正忙（登录/发送中），稍后再试"}, status_code=409)
     cfg = config.load_config()
+    # 群聊没有抖音号，跳过并提示；个人号才需要补全
+    groups = [t["name"] for t in cfg.get("targets", [])
+              if t.get("enabled") and t.get("group")]
     need = {t["name"]: t.get("avatar", "") for t in cfg.get("targets", [])
-            if t.get("enabled") and not t.get("uid")}
+            if t.get("enabled") and not t.get("uid") and not t.get("group")}
     if not need:
-        return {"ok": True, "msg": "所有已启用的目标都有抖音号，无需补全", "found": 0, "total": 0}
+        msg = "所有已启用的目标都有抖音号，无需补全"
+        if groups:
+            msg += "；%s 为群聊（无需抖音号）" % "、".join(groups[:6])
+        return {"ok": True, "msg": msg, "found": 0, "total": 0}
     found = douyin.enrich_uid(need)
     if found:
         for t in cfg["targets"]:
             info = found.get(t["name"])
             if info and info.get("uid"):
                 t["uid"] = info["uid"]
-        config.save_config(cfg)
+    # 2026-10-20：补全路上顺手抓到的头像也写回（聊天窗/主页/搜索卡片来源，只补缺失的）
+    harvested = dict(getattr(douyin, "AVATAR_HARVEST", {}) or {})
+    av_filled = 0
+    for t in cfg["targets"]:
+        if not t.get("avatar") and t["name"] in harvested:
+            t["avatar"] = harvested[t["name"]]
+            av_filled += 1
+    config.save_config(cfg)
     miss = [n for n in need if n not in found]
     msg = "补全成功 %d/%d 人" % (len(found), len(need))
+    if av_filled:
+        msg += "，补头像 %d 人" % av_filled
     if miss:
         msg += "；未匹配到： %s（可手动添加抖音号，或昵称与抖音号不一致导致）" % "、".join(miss[:6])
+    if groups:
+        msg += "；%s 为群聊（无需抖音号）" % "、".join(groups[:6])
     return {"ok": True, "msg": msg, "found": len(found), "total": len(need), "miss": miss}
 
 

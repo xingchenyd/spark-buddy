@@ -828,6 +828,8 @@ SESSIONS_JS = r"""
       const name = lines[0];
       if (!name || name.length > 40) return;
       const avatar = img ? (img.src || '') : '';
+      // 群聊特征：头像区是多张成员头像拼的九宫格/叠加图（个人号只有 1 张）
+      const isGroup = item.querySelectorAll('img').length >= 2;
       let spark = 0;
       for (let i = 1; i < Math.min(lines.length, 4); i++) {
         const ln = lines[i];
@@ -843,7 +845,8 @@ SESSIONS_JS = r"""
         }
       }
       const preview = lines.slice(1, 4).join(' · ').slice(0, 60);
-      if (!seen.has(name)) seen.set(name, {name: name, uid: '', avatar: avatar,
+      if (!seen.has(name)) seen.set(name, {name: name, uid: '', avatar: isGroup ? '' : avatar,
+                                           group: isGroup,
                                            preview: preview, spark: spark});
     } catch (e) {}
   });
@@ -1149,8 +1152,119 @@ def _search_uid_once(page, name, avatar=""):
     return None
 
 
+# 聊天窗头部头像点击：标题文本=会话名（备注名），点标题/头像进资料页或弹资料卡
+HEADER_PEER_JS = r"""
+(name) => {
+  const dlg = document.querySelector("[data-e2e='im-dialog']");
+  if (!dlg) return false;
+  const dr = dlg.getBoundingClientRect();
+  const walker = document.createTreeWalker(dlg, NodeFilter.SHOW_ELEMENT);
+  const cands = [];
+  let el;
+  while ((el = walker.nextNode())) {
+    if (el.children.length) continue;                    // 叶子文本节点
+    const t = (el.textContent || '').trim();
+    if (t !== name) continue;                            // 聊天窗标题=会话名
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    if (r.top < dr.top || r.top > dr.top + 130) continue;  // 顶部标题栏区域
+    cands.push(el);
+  }
+  if (!cands.length) return false;
+  // 标题旁边那颗头像（26-70px 的 img），没有就点标题本身
+  let target = cands[cands.length - 1];
+  let p = target.parentElement, img = null, hops = 0;
+  while (p && hops < 3 && !img) {
+    for (const i of p.querySelectorAll('img')) {
+      const r = i.getBoundingClientRect();
+      if (r.width >= 26 && r.width <= 70) { img = i; break; }
+    }
+    p = p.parentElement; hops++;
+  }
+  try { (img || target).click(); } catch (e) { return false; }
+  return true;
+}
+"""
+
+# 主页大头像提取（60-200px 的第一张 img）
+PROFILE_AVATAR_JS = r"""
+() => {
+  let best = '';
+  document.querySelectorAll('img').forEach(img => {
+    if (best) return;
+    const r = img.getBoundingClientRect();
+    if (r.width >= 60 && r.width <= 200 && r.height >= 60
+        && img.src && img.src.startsWith('http')) best = img.src;
+  });
+  return best;
+}
+"""
+
+
+def _uid_via_chat_profile(page, name):
+    """策略3：从会话列表打开聊天窗 → 点头部头像进资料页 → 直读抖音号。
+    2026-10-20 新增：备注名与抖音昵称不一致（备注「杨胤铖」、实际昵称「胤铖。」）
+    时，搜索页永远搜不到；会话入口 100% 精确，这条路是兜底王牌。
+    头像由 _find_and_open_conversation（会话项）与资料页（PROFILE_AVATAR_JS）双路抓取。
+    返回 uid 或 None。"""
+    try:
+        _goto_homepage(page)
+        page.wait_for_timeout(1200)
+        _open_message_center(page)
+        if not _sidebar_panel_visible(page):
+            _log("enrich %s: chat-profile path skipped (no sidebar)" % name)
+            return None
+        _find_and_open_conversation(page, name)   # 顺手抓会话项头像
+        page.wait_for_timeout(800)
+        if not page.evaluate(HEADER_PEER_JS, name):
+            _log("enrich %s: chat header peer not found" % name)
+            try:
+                _click_sidebar_back(page)
+            except Exception:
+                pass
+            return None
+        page.wait_for_timeout(3500)
+        # 情况A：新开/跳转到 /user/ 主页
+        for p in _context.pages:
+            if "/user/" in p.url:
+                try:
+                    txt = p.inner_text("body", timeout=6000)
+                except Exception:
+                    continue
+                m = re.search(r"抖音号[:：]\s*([A-Za-z0-9_.\-]+)", txt)
+                if m:
+                    try:
+                        src = p.evaluate(PROFILE_AVATAR_JS)
+                        if src and src not in ("", "about:blank"):
+                            AVATAR_HARVEST[name] = src
+                    except Exception:
+                        pass
+                    return m.group(1)
+                break
+        # 情况B：当前页弹出资料卡
+        try:
+            txt = page.inner_text("body", timeout=3000) or ""
+            m = re.search(r"抖音号[:：]\s*([A-Za-z0-9_.\-]+)", txt)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        _log("enrich %s: profile opened but no douyin-id text" % name)
+        return None
+    except Exception as e:
+        _log("enrich %s: chat-profile path error: %r" % (name, e))
+        return None
+    finally:
+        try:
+            page.keyboard.press("Escape")   # 关掉可能弹出的资料卡，回到干净状态
+        except Exception:
+            pass
+
+
 def enrich_uid(items):
     """搜人补全抖音号。items 可为 [昵称] 或 {昵称: 头像URL}（带头像可提高匹配率）。
+    2026-10-20：搜索失败后追加策略3（聊天窗点头像进主页直读，专治备注名）；
+    顺手抓到的头像统一进 AVATAR_HARVEST，由调用方写回配置。
     返回 {name: {"uid": ...}}，搜不到的人不在结果里。"""
     if isinstance(items, dict):
         pairs = [(k, v or "") for k, v in items.items() if (k or "").strip()]
@@ -1178,6 +1292,8 @@ def enrich_uid(items):
                             break
                         if attempt < 2:
                             time.sleep(random.uniform(3.0, 5.0))
+                    if not uid:
+                        uid = _uid_via_chat_profile(page, name)   # 策略3：备注名兜底
                     if uid:
                         out[name] = {"uid": uid}
                         _log("enrich %s -> uid=%s" % (name, uid))

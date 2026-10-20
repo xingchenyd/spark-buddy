@@ -111,6 +111,7 @@
   .mem .nm .n { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mem .nm .u { color: var(--muted); font-size: 11.5px; }
   .uid-chip { display: inline-block; background: var(--line2); color: #5a6078; border-radius: 5px; padding: 0 6px; font-size: 11px; font-family: Consolas, monospace; }
+  .group-chip { display: inline-block; background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; border-radius: 5px; padding: 0 6px; font-size: 11px; font-weight: 600; }
   .srow { display: flex; gap: 6px; }
   .srow input { min-width: 0; }
 
@@ -342,10 +343,11 @@ async function refreshStatus() {
     if (s.login_browser_open) lp.innerHTML = '<span class="dot warn"></span>扫码中…', lp.className = 'pill warn';
     else if (s.login_ok) lp.innerHTML = '<span class="dot ok"></span>' + esc(s.nickname || '已登录'), lp.className = 'pill ok';
     else lp.innerHTML = '<span class="dot err"></span>未登录', lp.className = 'pill err';
-    // KPI：今日发送
+    // KPI：今日发送（按目标最新记录统计，补发成功自动销账）
     document.getElementById('k-today').textContent = s.today.ok + ' / ' + s.today.total;
+    const fnames = (s.today.fail_names || []).join('、');
     document.getElementById('k-today-sub').innerHTML = s.today.fail
-      ? '<span style="color:var(--err)">失败 ' + s.today.fail + '</span> · 成功 ' + s.today.ok
+      ? '<span style="color:var(--err)" title="' + esc(fnames) + '">失败 ' + s.today.fail + '</span> · 成功 ' + s.today.ok
       : '成功 ' + s.today.ok + ' · 失败 ' + s.today.fail;
     document.getElementById('k-today-bar').style.width =
       (s.today.total ? Math.min(100, Math.round(s.today.ok / s.today.total * 100)) : 0) + '%';
@@ -390,10 +392,12 @@ function renderTargets() {
     const ini = esc((t.name || '?')[0]);
     const av = '<span class="avwrap"><span class="avatar">' + ini + '</span>'
       + (t.avatar ? '<img src="' + esc(t.avatar) + '" onerror="this.remove()">' : '') + '</span>';
-    const sub = t.uid ? '<span class="uid-chip">抖音号:' + esc(t.uid) + '</span>' : '<span class="muted">无抖音号</span>';
+    const grp = t.group ? ' <span class="group-chip">群聊</span>' : '';
+    const sub = t.group ? '<span class="group-chip">群聊 · 无需抖音号</span>'
+      : (t.uid ? '<span class="uid-chip">抖音号:' + esc(t.uid) + '</span>' : '<span class="muted">无抖音号</span>');
     tr.innerHTML = '<td><input type="checkbox" style="width:auto" ' + (t.enabled ? 'checked' : '') + ' onchange="toggleTarget(' + i + ', this.checked)"></td>'
       + '<td><div class="mem">' + av
-      + '<div class="nm"><div class="n">' + esc(t.name) + '</div><div class="u">' + sub + '</div></div></div></td>'
+      + '<div class="nm"><div class="n">' + esc(t.name) + grp + '</div><div class="u">' + sub + '</div></div></div></td>'
       + '<td><div class="srow">'
       + '<input type="text" id="one-' + i + '" placeholder="留空=统一内容" onkeydown="if(event.key===\'Enter\')sendOne(' + i + ')">'
       + '<button class="btn small" style="flex:none" onclick="sendOne(' + i + ')">发</button></div></td>'
@@ -415,9 +419,12 @@ function addTarget() {
 }
 
 async function enrichUid() {
-  const empty = (CFG.targets || []).filter(t => t.enabled && !t.uid);
-  if (!empty.length) return show('所有已启用的目标都有抖音号了');
-  show('正在为主站搜索补全 ' + empty.length + ' 人的抖音号…（每人约 5 秒，期间会弹出浏览器窗口）');
+  const empty = (CFG.targets || []).filter(t => t.enabled && !t.uid && !t.group);
+  const groups = (CFG.targets || []).filter(t => t.enabled && t.group);
+  if (!empty.length) {
+    return show(groups.length ? '个人目标都有抖音号了（' + groups.length + ' 个群聊无需抖音号）' : '所有已启用的目标都有抖音号了');
+  }
+  show('正在补全 ' + empty.length + ' 人的抖音号与头像…（每人约 5-15 秒，期间会弹出浏览器窗口；群聊自动跳过）');
   try {
     const r = await j('/api/contacts/enrich', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     await refreshConfig();
@@ -520,11 +527,12 @@ function renderPicker() {
     const ini = esc((c.name || '?')[0]);
     const av = '<span class="avwrap"><span class="avatar">' + ini + '</span>'
       + (c.avatar ? '<img src="' + esc(c.avatar) + '" onerror="this.remove()">' : '') + '</span>';
-    const sub = (c.uid ? '抖音号:' + esc(c.uid) : '未识别到抖音号')
+    const sub = (c.group ? '<span class="group-chip">群聊</span> · '
+      : (c.uid ? '抖音号:' + esc(c.uid) : '未识别到抖音号'))
       + (c.preview ? ' · ' + esc(c.preview) : '');
     div.innerHTML = '<input type="checkbox" checked data-i="' + i + '">'
       + av
-      + '<div class="nm"><div class="n">' + esc(c.name) + '</div><div class="u">' + sub + '</div></div>';
+      + '<div class="nm"><div class="n">' + esc(c.name) + (c.group ? ' <span class="group-chip">群聊</span>' : '') + '</div><div class="u">' + sub + '</div></div>';
     box.appendChild(div);
   });
 }
@@ -539,7 +547,7 @@ function addPicked() {
     if (!c) return;
     const key = c.uid || ('name:' + c.name);
     if (CFG.targets.some(t => (t.uid || ('name:' + t.name)) === key)) { dup++; return; }
-    CFG.targets.push({ name: c.name, uid: c.uid || '', avatar: c.avatar || '', enabled: true });
+    CFG.targets.push({ name: c.name, uid: c.uid || '', avatar: c.avatar || '', enabled: true, group: !!c.group });
     added++;
   });
   closePicker();
