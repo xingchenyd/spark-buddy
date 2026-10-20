@@ -433,23 +433,34 @@ def _dialog_text_count(page, text):
         return -1
 
 
-def _chat_input_cleared(page):
-    """聊天输入框是否已清空（客户端接受发送后会立即清空输入框）。"""
+def _input_box_text(page):
+    """取聊天主输入框的当前文本（im-dialog 内面积最大的「大块」可见 contenteditable）。
+    返回 None=找不到输入框（DOM 重建中/视图切换），''=空，其他=文本内容。
+    2026-10-20 重写清空判定：旧版要求 im-dialog 内全部 contenteditable 都空才算
+    清空，会被表情面板/搜索框等无关可编辑元素拖累而永远判 False（当天它叫多多
+    实际已送达却被误报失败）。现在只盯主输入框本身。"""
     try:
         return page.evaluate(
             r"""
 () => {
-  const boxes = document.querySelectorAll("[data-e2e='im-dialog'] div[contenteditable='true']");
-  if (!boxes.length) return false;
+  const dlg = document.querySelector("[data-e2e='im-dialog']");
+  if (!dlg) return null;
+  const boxes = dlg.querySelectorAll("div[contenteditable='true']");
+  let best = null, bestArea = 0;
   for (const b of boxes) {
-    if ((b.innerText || '').trim().length > 0) return false;
+    const r = b.getBoundingClientRect();
+    if (r.width > 200 && r.height >= 18 && r.height < 300) {
+      const area = r.width * r.height;
+      if (area > bestArea) { bestArea = area; best = b; }
+    }
   }
-  return true;
+  if (!best) return null;
+  return (best.innerText || '');
 }
 """
         )
     except Exception:
-        return False
+        return None
 
 
 def _dialog_tail_hint(page):
@@ -561,6 +572,27 @@ def _find_and_open_conversation(page, name):
     if hint:
         msg += "；页面提示: %s" % hint
     raise SendFailed(msg)
+
+
+def _reopen_conversation(page, name):
+    """回会话列表再重新打开该会话：强制客户端重新拉取并渲染消息列表。
+    2026-10-20 它叫多多案例：消息服务端已送达（用户手机可见），但聊天窗 DOM
+    在 15s 校验窗口内始终未渲染新气泡——重开会话即可恢复。返回聊天窗是否就绪。"""
+    try:
+        _click_sidebar_back(page)
+        page.wait_for_timeout(1200)
+        if not _sidebar_panel_visible(page):
+            _open_message_center(page)
+        if not _sidebar_panel_visible(page):
+            _log("reopen_conversation: sidebar panel still not visible")
+            return False
+        _find_and_open_conversation(page, name)
+        ok = _wait_chat_input(page, 6000) is not None
+        _log("reopen_conversation [%s]: chat view ready=%s" % (name, ok))
+        return ok
+    except Exception as e:
+        _log("reopen_conversation error: %r" % e)
+        return False
 
 
 def _goto_retry(page, url, attempts=5, **kw):
@@ -1189,43 +1221,83 @@ def _send_once(name, text):
             before = page.get_by_text(text).count()
         page.keyboard.insert_text(text)
         page.wait_for_timeout(400)
+        # 输入确认：文本确实进了输入框（焦点丢失时 insert_text 会落空，
+        # 此时「输入框为空」是常态，绝不能作为发送成功的依据）
+        typed = _input_box_text(page)
+        input_filled = typed is not None and typed.strip() != ""
+        if not input_filled:
+            box.click()
+            page.wait_for_timeout(200)
+            page.keyboard.insert_text(text)
+            page.wait_for_timeout(300)
+            typed = _input_box_text(page)
+            input_filled = typed is not None and typed.strip() != ""
+            _log("send_once [%s]: refilled input after focus loss (filled=%s)" % (name, input_filled))
         page.keyboard.press("Enter")
-        page.wait_for_timeout(400)
-        # 兜底：Enter 无效时尝试点发送按钮
-        btn = _first_visible(page, SEND_BUTTON_SELECTORS, timeout=1200)
-        if btn is not None:
-            try:
-                btn.click()
-            except Exception:
-                pass
+        page.wait_for_timeout(600)
+        # 兜底：仅当 Enter 没发出去（输入框仍有文本）才点发送按钮。
+        # 旧版无条件点击可能误触发表情面板等弹层，其内部 contenteditable
+        # 会污染清空判定（2026-10-20 它叫多多误报复盘）。
+        if input_filled and (_input_box_text(page) or "").strip():
+            btn = _first_visible(page, SEND_BUTTON_SELECTORS, timeout=1200)
+            if btn is not None:
+                try:
+                    btn.click()
+                except Exception:
+                    pass
 
-        # 强校验：15 秒内任一信号确认发送成功
+        # 强校验三信号（15s + 重开后 10s）：
         # 信号1（最强）：对话区 innerText 中该文本出现次数增加（before/after 排除同文本历史）
-        # 信号2（兜底）：输入框被清空且保持清空 = 客户端已接受发送（气泡渲染/回执可能滞后，
-        #              2026-10-17 贵宾小吴实际已送达却被判失败即此类）
+        # 信号2（兜底）：发送前输入框有文本 → 发送后被清空并保持清空 = 客户端已接受发送
+        # 信号3（2026-10-20 新增）：前两者无果时回列表重开会话，强制客户端重拉消息列表——
+        #              专治「服务端已送达、本地气泡迟迟不渲染」（当天它叫多多即此，用户手机已收到）
+        # 全程记录采样（before/cnt/输入框状态），失败时随错误信息输出，不再盲猜。
         ok = False
         input_cleared = False
         cleared_streak = 0
+        samples = ["before=%d" % before]
         for _ in range(30):
             page.wait_for_timeout(500)
             cnt = _dialog_text_count(page, text)
             if cnt < 0:
                 cnt = page.get_by_text(text).count()
+            cur = _input_box_text(page)
+            box_empty = cur is not None and cur.strip() == ""
             if cnt > before:
                 ok = True
                 break
-            if _chat_input_cleared(page):
+            if input_filled and box_empty:
                 cleared_streak += 1
                 if cleared_streak >= 2:
                     input_cleared = True
+                    # 不 break：气泡若随后渲染出来，报「已发送」更准确
             else:
                 cleared_streak = 0
+            if len(samples) < 10:
+                samples.append("cnt=%d,in=%s" % (cnt, "E" if box_empty else ("F" if cur is not None else "?")))
         if not ok and input_cleared:
             _log("send_message -> %s OK (input cleared, bubble lag)" % name)
             return True, "已发送（气泡校验超时，但输入框已清空，消息已进入发送队列）"
         if not ok:
+            # 信号3：重开会话强制刷新消息列表
+            _log("send_once [%s]: signals 1/2 failed (%s) -> reopen to force refresh"
+                 % (name, "; ".join(samples[-3:])))
+            if _reopen_conversation(page, name):
+                for _ in range(20):
+                    page.wait_for_timeout(500)
+                    cnt = _dialog_text_count(page, text)
+                    if cnt < 0:
+                        cnt = page.get_by_text(text).count()
+                    if cnt > before:
+                        ok = True
+                        break
+                if ok:
+                    _log("send_message -> %s OK (confirmed after reopen)" % name)
+                    return True, "已发送（重开会话后确认到消息气泡）"
+        if not ok:
             tail = _dialog_tail_hint(page)
-            raise SendFailed("发送后未检测到消息气泡（可能被风控或页面改版）"
+            raise SendFailed("发送后未检测到消息气泡（可能被风控或页面改版）；采样: %s"
+                             % "; ".join(samples)
                              + ("；页面尾部内容: %s" % tail if tail else ""))
         _log("send_message -> %s OK" % name)
         return True, "已发送"
