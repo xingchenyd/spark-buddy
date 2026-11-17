@@ -183,22 +183,21 @@ def status():
     # 2026-10-20 修复：此前把所有条目简单累加，补发成功/修正后旧 FAIL 条目仍在，
     # 顶部失败人数只加不减。
     enabled_names = {t.get("name", "") for t in cfg.get("targets", []) if t.get("enabled", True)}
-    latest = {}
-    for e in config.read_history(500):
-        if e.get("time", "").startswith(today):
-            name = e.get("name", "")
-            if name in enabled_names:
-                latest[name] = bool(e.get("ok"))
-    ok = sum(1 for v in latest.values() if v)
-    fail = len(latest) - ok
-    fail_names = [n for n, v in latest.items() if not v]
+    all_status = config.latest_today_status(today)
+    latest = {n: r for n, r in all_status.items() if n in enabled_names}
+    ok = sum(1 for r in latest.values() if r["status"] == "success")
+    unknown = sum(1 for r in latest.values() if r["status"] == "unknown")
+    fail = sum(1 for r in latest.values() if r["status"] == "failed")
+    fail_names = [n for n, r in latest.items() if r["status"] == "failed"]
+    unknown_names = [n for n, r in latest.items() if r["status"] == "unknown"]
     enabled = [t for t in cfg.get("targets", []) if t.get("enabled", True)]
     return {
         "nickname": st.get("nickname", ""),
         "login_ok": bool(st.get("login_ok")),
         "login_browser_open": bool(_login_thread and _login_thread.is_alive()),
         "task_running": scheduler.task_running,
-        "today": {"total": len(enabled), "ok": ok, "fail": fail, "fail_names": fail_names},
+        "today": {"total": len(enabled), "ok": ok, "fail": fail, "fail_names": fail_names,
+                  "unknown": unknown, "unknown_names": unknown_names},
         "targets_enabled": len(enabled),
         "targets_total": len(cfg.get("targets", [])),
         "next": scheduler.next_run_info(),
@@ -207,8 +206,9 @@ def status():
         "browser": douyin.browser_diagnostics(),
         "infra_error": getattr(scheduler, "last_infra_error", ""),
         "code_version": config.CODE_VERSION,
-        # 今天已执行过发送动作的目标数（幂等锁口径，防止失败重试导致重复打扰）
-        "attempted_today": len(config.today_attempted_names(today)),
+        # 今天【确认送达】的目标数（幂等锁只挡确认成功的，UNKNOWN 不锁死）
+        "attempted_today": len(config.today_ok_names(today)),
+        "unknown_today": len(config.today_unknown_names(today)),
     }
 
 
@@ -431,7 +431,7 @@ def run_now():
     if _login_thread and _login_thread.is_alive():
         return JSONResponse({"ok": False, "msg": "登录窗口开着，请先完成或关闭扫码登录"}, status_code=409)
     threading.Thread(target=scheduler.run_daily_task, kwargs={"mark_done": False}, daemon=True).start()
-    return {"ok": True, "msg": "发送任务已启动（跳过今天已成功的目标）"}
+    return {"ok": True, "msg": "发送任务已启动（跳过今天已确认送达的目标；待核对的不自动重发）"}
 
 
 @app.post("/api/send-one")
@@ -450,25 +450,53 @@ def send_one(body: dict):
     scheduler.task_running = True
     try:
         try:
-            # 手动单独发送默认同样受幂等锁保护；仅当面板显式传 force=true
-            # 才允许当天对同一人重发（用户知情并主动触发）。
-            ok, detail = douyin.send_message(
-                name, text, force=bool(body.get("force")))
+            # 2026-11-17：解除「误判成功后整天不能补发」的限制。
+            # 手动发送即用户明确意图：UNKNOWN / failed 一律直接重发；
+            # 只有「已确认成功」的才需要显式 force=true 才重发（防手滑重复）。
+            # 只有「确认送达」才提示强制确认；UNKNOWN / failed 目标直接补发，
+            # 不再被 attempts（按过发送键）误判为已发而锁死（用户明确要求解除）。
+            already = name in config.today_ok_names(_today())
+            force = bool(body.get("force"))
+            if already and not force:
+                return {"ok": False, "need_force": True,
+                        "msg": "「%s」今日已【确认送达】。若确认对方没收到、要再发一次，"
+                               "请点「强制补发」。" % name}
+            result = douyin.send_message(name, text, force=True)
+            if len(result) == 2:
+                ok, detail = result
+                status = "success" if ok else "failed"
+            else:
+                ok, detail, status = result
         except douyin.InfraError as e:
-            # 环境级故障不算这个人的失败，也不写历史；面板给出可操作提示
             scheduler.last_infra_error = str(e)
             return {"ok": False, "msg": "环境未就绪，未执行发送：%s" % e}
         config.add_history({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "name": name,
-            "ok": ok,
+            "ok": bool(ok),
+            "status": status,
             "detail": detail,
             "text": text,
         })
-        scheduler._flush_avatars()   # 单独发送也可能顺手抓到头像
-        return {"ok": ok, "msg": ("%s：%s" % (name, detail)) if ok else ("%s 发送失败：%s" % (name, detail))}
+        scheduler._flush_avatars()
+        if status == "unknown":
+            return {"ok": False, "status": "unknown",
+                    "msg": "%s：结果待核对（可能已送达）。请到抖音确认后再决定是否补发。" % name}
+        return {"ok": ok, "status": status,
+                "msg": ("%s：%s" % (name, detail)) if ok else ("%s 发送失败：%s" % (name, detail))}
     finally:
         scheduler.task_running = False
+
+
+@app.post("/api/mark-resolved")
+def mark_resolved(body: dict):
+    """人工核对后把某人今日状态标记为「已确认送达」（不再提示待核对）。"""
+    name = str(body.get("name", "")).strip()
+    cfg = config.load_config()
+    if not any(t["name"] == name for t in cfg.get("targets", [])):
+        return JSONResponse({"ok": False, "msg": "「%s」不在目标列表中" % name}, status_code=400)
+    config.mark_resolved(_today(), name)
+    return {"ok": True, "msg": "%s 已标记为人工确认送达" % name}
 
 
 @app.post("/api/shutdown")

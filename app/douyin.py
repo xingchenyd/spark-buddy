@@ -99,7 +99,161 @@ class NotLoggedIn(InfraError):
 
 
 class SendFailed(Exception):
+    """明确失败：文本没写进去、对象没打开、页面提示发送失败。可以安全重试。"""
     pass
+
+
+class SendUnknown(Exception):
+    """结果不确定：消息可能已发出，但客户端未给出终态。绝不能自动重试。
+
+    借鉴 unmev/douyin-auto-fire 的设计：抖音先渲染我方气泡，之后才挂载
+    发送状态（spinner / 红色重试标记）。只看到气泡就判成功是假成功；
+    超时未进入终态一律 UNKNOWN，保留人工核对入口而不是自动重发。
+    """
+    pass
+
+
+# ---- 发送终态确认（移植自 unmev/douyin-auto-fire/app/sender.py 的核心思路）----
+# 关键：锚定「最新一条我方消息」，发送后观察同一条消息的状态变化，
+# 而不是数整页固定文本 / 数消息行总数（虚拟列表与历史加载会让它随机漂移）。
+OUTGOING_MSG_SELECTOR = (
+    ".messageMessageListlist [data-index='0'] "
+    ".messageMessageBoxmessageBox:has(.messageMessageBoxcontentBox.messageMessageBoxisFromMe)"
+)
+# 失败标记：红色重试按钮 / 发送失败文案。刻意排除裸 SendStatusicon——
+# 它和其它发送状态共用，误判会造成假失败。
+SEND_FAILURE_SELECTORS = (
+    "text=发送失败",
+    "[aria-label*='重试']",
+    "[title*='重试']",
+    '[class*="ContentSideSendStatusretry"]',
+    '[class*="SendStatusretry"]',
+)
+SEND_PENDING_SELECTORS = (
+    ".semi-spin",
+    '[class*="im-saas-message-spin"]',
+    '[data-icon="spin"]',
+)
+SEND_ANCHOR_ATTR = "data-sb-msg-anchor"
+SEND_CONFIRM_TIMEOUT_S = 15.0
+SEND_INITIAL_GRACE_S = 2.0   # 气泡刚出现时还未挂载状态，需持续观察
+SEND_STABLE_S = 0.5          # spinner 消失后再稳定观察，防延迟挂载的重试标记
+
+
+def _norm_msg(s):
+    """消息文本归一：去掉零宽字符与多余空白（Slate/Slate 空态用 U+200B）。"""
+    if not s:
+        return ""
+    for ch in _ZERO_WIDTH:
+        s = s.replace(ch, "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _anchor_latest_outgoing(page):
+    """给当前最新一条我方消息打唯一锚点，记录其内容 HTML。
+
+    返回 (anchor, before_html)；找不到我方消息时返回 ("", "")（此时发送后
+    无从判断"新增"，只能靠输入框清空 + 终态，仍可工作但可靠性下降）。
+    """
+    try:
+        return page.evaluate(r"""
+([attr, selector]) => {
+  const el = document.querySelector(selector);
+  if (!el) return ["", ""];
+  const content = el.querySelector('[data-e2e="msg-item-content"]') || el;
+  const anchor = 'sb' + Math.random().toString(36).slice(2, 12);
+  el.setAttribute(attr, anchor);
+  return [anchor, content.innerHTML || ''];
+}
+""", [SEND_ANCHOR_ATTR, OUTGOING_MSG_SELECTOR])
+    except Exception:
+        return "", ""
+
+
+def _clear_msg_anchor(page):
+    try:
+        page.evaluate("""(attr) => document.querySelectorAll('[' + attr + ']')
+            .forEach(e => e.removeAttribute(attr))""", SEND_ANCHOR_ATTR)
+    except Exception:
+        pass
+
+
+def _outgoing_state(page, anchor, before_html, text, selector=OUTGOING_MSG_SELECTOR):
+    """读取锚点消息是否更新、是否命中目标文本、是否出现终态标记。
+
+    返回 dict：new / textMatch / failed / pending / text。
+    """
+    try:
+        return page.evaluate(r"""
+([attr, selector, anchor, beforeHtml, expected]) => {
+  const norm = v => (v || '').replace(/[\s\u200B\u200C\u200D\uFEFF]+/g, ' ').trim();
+  const el = document.querySelector(selector);
+  if (!el) return { new:false, textMatch:false, failed:false, pending:false, text:'' };
+  const content = el.querySelector('[data-e2e="msg-item-content"]') || el;
+  const html = content.innerHTML || '';
+  const isNew = el.getAttribute(attr) !== anchor || html !== beforeHtml;
+  const txt = norm(content.innerText);
+  const visible = e => { try { const r = e.getBoundingClientRect();
+                              return r.width > 0 && r.height > 0; } catch(_) { return false; } };
+  const failed = (el.innerText || '').includes('发送失败') ||
+      ['[aria-label*="重试"]','[title*="重试"]',
+       '[class*="ContentSideSendStatusretry"]','[class*="SendStatusretry"]',
+       '[class*="sendFailed"]','[class*="SendFailed"]']
+        .some(s => [...el.querySelectorAll(s)].some(visible));
+  const pending = ['.semi-spin','[class*="im-saas-message-spin"]','[data-icon="spin"]']
+        .some(s => [...el.querySelectorAll(s)].some(visible));
+  return { new:!!isNew, textMatch: txt.includes(norm(expected)),
+           failed:!!failed, pending:!!pending, text: txt.slice(0, 70) };
+}
+""", [SEND_ANCHOR_ATTR, selector, anchor, before_html, text])
+    except Exception:
+        return {"new": False, "textMatch": False, "failed": False,
+                "pending": False, "text": ""}
+
+
+def _confirm_send(page, anchor, before_html, text):
+    """等待发送进入终态：成功 / 明确失败 / 不确定（抛 SendUnknown）。
+
+    这是本项目与旧版最本质的区别：旧版「看到新气泡」或「输入框清空」就算成功，
+    而抖音这两者都可能先于真实发送结果发生（气泡先渲染、状态后挂载）。
+    现在必须看到目标消息且状态稳定；始终看不到就判 UNKNOWN 且绝不自动重试。
+    """
+    expected = _norm_msg(text)
+    deadline = time.monotonic() + SEND_CONFIRM_TIMEOUT_S
+    matched = False
+    samples = []
+    # 阶段 1：等待「新增一条我方消息且文本匹配」
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(300)
+        st = _outgoing_state(page, anchor, before_html, text)
+        if len(samples) < 6:
+            samples.append("new=%d,match=%d,fail=%d,pend=%d" %
+                           (st["new"], st["textMatch"], st["failed"], st["pending"]))
+        if st["failed"] and st["new"]:
+            raise SendFailed("页面显示发送失败/重试标记")
+        if st["new"] and st["textMatch"]:
+            matched = True
+            break
+    if not matched:
+        # 没看到新气泡：检查输入框。仍有全文 = 明确没发出去；已清空 = 不确定
+        cur = _read_input(page)
+        if cur is not None and expected and expected in _norm_msg(cur):
+            raise SendFailed("文本仍在输入框，发送未执行")
+        raise SendUnknown("按发送键后未见新消息（可能已送达，请人工核对）；采样: %s"
+                          % "; ".join(samples))
+    # 阶段 2：终态观察。新气泡刚挂载时状态未定，先持续观察 grace 窗口。
+    grace_end = time.monotonic() + SEND_INITIAL_GRACE_S
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(300)
+        st = _outgoing_state(page, anchor, before_html, text)
+        if st["failed"]:
+            raise SendFailed("消息出现发送失败/重试标记")
+        if st["pending"]:
+            grace_end = time.monotonic() + SEND_STABLE_S
+            continue
+        if time.monotonic() >= grace_end:
+            return "已发送（新消息 + 终态确认）"
+    raise SendUnknown("消息已出现但发送状态未能确认（可能已送达，请人工核对）")
 
 
 # ---- 浏览器可执行文件自动发现（不再绑定单一 revision）----
@@ -1566,20 +1720,24 @@ def enrich_uid(items):
 
 
 def _send_once(page, name, text, force=False):
-    """单次发送。返回 (ok, detail)。
+    """单次发送。返回 (ok, detail, status)。
 
-    2026-11-17 重写，修复「同一人一天收到 4 条 / 部分人没发」：
-    1) 幂等锁：按下 Enter **之前**先落盘登记发送动作。之后无论校验成功、
-       失败还是进程崩溃，当天都不会再对该目标执行第二次发送动作；
-    2) 输入框只认聊天窗 Slate 编辑器，空状态零宽空格按「已清空」处理；
-    3) 删除「Enter 后输入框仍有文本就再点一次发送按钮」的兜底——它是
-       重复投递的直接推手，且实测 Enter 本身已能把消息发出去；
-    4) 成功判据：输入框清空 或 含目标文本的消息行数增加。
+    status ∈ {success, failed, unknown}：
+    - success：确认到新消息且终态正常 → 记入「今日已完成」；
+    - failed：明确没发出去（写不进/对象没打开/页面报错）→ 可安全重试；
+    - unknown：按了发送键但无法确认 → **绝不自动重试**，只在面板标记待核对。
+
+    2026-11-17 二次事故后按 unmev/douyin-auto-fire 的思路重写：
+    幂等锁只挡「已确认成功」的目标；UNKNOWN 不锁死——用户核实后可选择
+    手动补发，这正是旧版「误判成功后当天不能补发」弊端的根源。
     """
     day = datetime.now().strftime("%Y-%m-%d")
-    if not force and config.already_attempted_today(name):
-        _log("send_message -> %s SKIP (already attempted today)" % name)
-        return True, "今日已发送过，跳过（幂等保护，避免重复打扰）"
+    # 幂等闸门只认「今日已确认送达」。绝不能按「按过发送键」(attempts) 短路——
+    # 那样 failed/unknown 目标会被误记成 success，正是 11-17「没发却标记成功、
+    # 然后当天锁死不能补发」的直接成因。attempts 仅作审计，不作闸门。
+    if not force and name in config.today_ok_names(day):
+        _log("send_message -> %s SKIP (already confirmed success today)" % name)
+        return True, "今日已确认送达，跳过（避免重复打扰）", "success"
 
     try:
         _ensure_conversation_list(page)
@@ -1597,52 +1755,34 @@ def _send_once(page, name, text, force=False):
         if not typed_ok:
             raise SendFailed("文本未能写入聊天输入框（未执行发送，避免空发）；观察到 %r" % observed)
 
-        before = _chat_bubbles(page)
-        before_hits = sum(1 for t in before if text in t)
+        # 发送前给「最新一条我方消息」打锚点。发送后只观察这一条是否更新、
+        # 是否带目标文本、状态是否进入终态——不再数整页文本或消息行数。
+        anchor, before_html = _anchor_latest_outgoing(page)
+        config.record_attempt(day, name, text)   # 按下发送键之前的最后一步
+        try:
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(250)
+            detail = _confirm_send(page, anchor, before_html, text)
+        finally:
+            _clear_msg_anchor(page)
 
-        # 幂等登记：放在发送动作之前的最后一步。
-        config.record_attempt(day, name, text)
-        page.keyboard.press("Enter")
-
-        cleared_streak = 0
-        samples = []
-        for _ in range(24):
-            page.wait_for_timeout(500)
-            cur = _read_input(page)
-            if cur is None:
-                # DOM 重建导致标记丢失：重新定位后再读，不能当成「已清空」
-                _mark_input_box(page)
-                cur = _read_input(page)
-            after = _chat_bubbles(page)
-            hits = sum(1 for t in after if text in t)
-            empty = _input_is_empty(cur)
-            cleared_streak = cleared_streak + 1 if empty else 0
-            if len(samples) < 8:
-                samples.append("in=%s,hit=%d->%d"
-                               % ("E" if empty else ("F" if cur is not None else "?"),
-                                  before_hits, hits))
-            if hits > before_hits:
-                _log("send_message -> %s OK (new own message)" % name)
-                return True, "已发送（聊天窗确认到新消息）"
-            if cleared_streak >= 2:
-                _log("send_message -> %s OK (input cleared)" % name)
-                return True, "已发送（输入框已清空，客户端已接受发送）"
-        tail = _dialog_tail_hint(page)
-        raise SendFailed("发送后 12s 内未确认到新消息（已登记发送动作，今天不会自动重发）；采样: %s"
-                         % "; ".join(samples)
-                         + ("；页面尾部: %s" % tail if tail else ""))
+        _log("send_message -> %s OK (%s)" % (name, detail))
+        return True, detail, "success"
     except InfraError:
         raise
+    except SendUnknown as e:
+        _log("send_message -> %s UNKNOWN: %s" % (name, e))
+        return False, str(e), "unknown"
     except SendFailed as e:
         _log("send_message -> %s FAIL: %s" % (name, e))
-        return False, str(e)
+        return False, str(e), "failed"
     except Exception as e:
         from playwright.sync_api import TimeoutError as PWTimeout
 
         if isinstance(e, PWTimeout):
-            return False, "页面加载超时: %s" % e
+            return False, "页面加载超时: %s" % e, "unknown"
         _log("send_message error: %r" % e)
-        return False, "异常: %r" % e
+        return False, "异常: %r" % e, "unknown"
 
 
 def begin_batch():
@@ -1683,10 +1823,11 @@ def end_batch():
 
 
 def send_message(name, text, page=None, force=False):
-    """给 name 发送一条 text。返回 (ok, detail)。
+    """给 name 发送一条 text。返回 (ok, detail, status)。
 
-    page 非空时复用批次浏览器；force=True 仅用于用户明确要求的手动强制重发，
-    正常调度一律走幂等锁（当天最多一次发送动作）。
+    page 非空时复用批次浏览器；force=True 仅用于用户明确要求的手动强制补发。
+    status=unknown 时结果不确定，调用方必须标记「待核对」而不是计入成功或
+    自动重试。
     """
     if page is not None:
         return _send_once(page, name, text, force=force)

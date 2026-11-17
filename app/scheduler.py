@@ -77,21 +77,29 @@ def _send_round(todo, cfg, page):
 
     InfraError 不在此捕获，直接冒泡到 run_daily_task 整轮短路。
     """
-    stat = {"total": len(todo), "ok": 0, "fail": 0}
+    stat = {"total": len(todo), "ok": 0, "fail": 0, "unknown": 0}
     lo = max(3, int(cfg.get("min_delay", 30)))
     hi = max(lo + 1, int(cfg.get("max_delay", 90)))
     text = build_message(cfg)
     for i, t in enumerate(todo):
         name = t["name"].strip()
-        ok, detail = douyin.send_message(name, text, page=page)
+        result = douyin.send_message(name, text, page=page)
+        # 兼容旧版 mock/插件可能只返回二元组
+        if len(result) == 2:
+            ok, detail = result
+            status = "success" if ok else "failed"
+        else:
+            ok, detail, status = result
         config.add_history({
             "time": _now().strftime("%Y-%m-%d %H:%M:%S"),
             "name": name,
-            "ok": ok,
+            "ok": bool(ok),
+            "status": status,
             "detail": detail,
             "text": text,
         })
-        stat["ok" if ok else "fail"] += 1
+        # unknown 既不算成功也不算失败：它是"需要人工核对"，绝不触发自动补发
+        stat["ok" if status == "success" else ("unknown" if status == "unknown" else "fail")] += 1
         if i < len(todo) - 1:
             d = random.uniform(lo, hi)
             _log("等待 %.0fs 后发送下一个" % d)
@@ -114,10 +122,10 @@ def run_daily_task(mark_done=True):
     try:
         cfg = config.load_config()
         today = _today()
-        # 2026-11-17：以「是否执行过发送动作」为准，而不是「是否校验成功」。
-        # 旧版只看 ok=True，校验层一旦集体误判就会整轮重跑，造成同一人一天
-        # 收到 4 条。结果可以不确定，动作必须最多一次。
-        done = config.today_ok_names(today) | config.today_attempted_names(today)
+        # 2026-11-17 二次修正：UNKNOWN 不再写入 attempts 锁，也不能被
+        # today_ok_names 当成成功。自动任务只跳过「已确认成功」的目标；
+        # 明确失败可自动重试，UNKNOWN 留给面板人工核对/手动补发。
+        done = config.today_ok_names(today)
         targets = [t for t in cfg.get("targets", []) if t.get("enabled", True)]
         todo = [t for t in targets if t["name"] not in done]
         _log("start: %d 目标, %d 今日已处理, %d 待发"
@@ -132,10 +140,14 @@ def run_daily_task(mark_done=True):
         page = douyin.begin_batch()
         last_infra_error = ""
         stat = _send_round(todo, cfg, page)
+        # 第二轮只对「明确失败」的目标补发；UNKNOWN 绝不自动重试，
+        # 否则消息其实送达时会造成重复打扰（11-17 事故的直接推手）。
         if cfg.get("second_round") and stat["ok"]:
-            done_now = (config.today_ok_names(today)
-                        | config.today_attempted_names(today))
-            failed = [t for t in todo if t["name"] not in done_now]
+            confirmed = config.today_ok_names(today)
+            failed_names = {n for n, r in config.latest_today_status(today).items()
+                            if r["status"] == "failed"}
+            failed = [t for t in todo
+                      if t["name"] not in confirmed and t["name"] in failed_names]
             if failed:
                 _log("second round: 对 %d 个失败目标追加一轮" % len(failed))
                 stat2 = _send_round(failed, cfg, page)

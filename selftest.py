@@ -184,23 +184,79 @@ def main(live=False):
     finally:
         douyin._open = orig_open
 
-    # 5c. 幂等锁：登记过发送动作后，当天绝不执行第二次（2026-11-17 事故回归）
+    # 5c. 幂等语义：attempts 只是审计流水，绝不锁死补发；只有「确认成功」才短路。
+    #     2026-11-17 三次事故回归：误判成功/UNKNOWN 的目标当天必须能补发。
     with tempfile.TemporaryDirectory(prefix="sb_idem_") as d:
         orig_ap = config.ATTEMPTS_PATH
+        orig_hp = config.HISTORY_PATH
         config.ATTEMPTS_PATH = Path(d) / "attempts.jsonl"
+        config.HISTORY_PATH = Path(d) / "history.jsonl"
         try:
             day = time.strftime("%Y-%m-%d")
             check("no attempt initially", not config.already_attempted_today("__idem__"))
             config.record_attempt(day, "__idem__", TEXT)
             check("attempt recorded", config.already_attempted_today("__idem__"))
-            # _send_once 在触碰任何浏览器对象之前就短路，page=None 也不会被使用
-            ok, detail = douyin._send_once(None, "__idem__", TEXT)
-            check("second send short-circuits before browser",
-                  ok and "跳过" in detail, detail)
-            check("attempted target visible to scheduler",
+            # 只按过发送键（UNKNOWN/failed）绝不能短路成成功 —— 这是关键回归：
+            # 传一个假 page，若闸门错误地在开头返回 success，则 _ensure_conversation_list
+            # 不会被调用（called=False）；若正确放行到浏览器阶段，则该桩被调用。
+            called = [False]
+            orig_ensure = douyin._ensure_conversation_list
+            def _boom(page):
+                called[0] = True
+                raise RuntimeError("reached browser stage")
+            douyin._ensure_conversation_list = _boom
+            try:
+                try:
+                    douyin._send_once(object(), "__idem__", TEXT)
+                except Exception:
+                    pass
+            finally:
+                douyin._ensure_conversation_list = orig_ensure
+            check("attempt alone does NOT short-circuit (补发 unlocked)",
+                  called[0], "闸门错误地把仅 attempt 的目标当成功锁死")
+
+            # 写入「确认成功」后再调用，才应在触碰浏览器前短路返回 success
+            config.add_history({"time": day + " 08:00:00", "name": "__confirmed__",
+                                "ok": True, "status": "success", "detail": "已确认送达"})
+            result2 = douyin._send_once(None, "__confirmed__", TEXT)
+            check("confirmed success short-circuits before browser",
+                  result2[0] and "跳过" in result2[1], repr(result2))
+            check("short-circuit reports success status",
+                  len(result2) == 3 and result2[2] == "success", repr(result2))
+            check("attempted target still visible to scheduler (audit)",
                   "__idem__" in config.today_attempted_names(day))
         finally:
             config.ATTEMPTS_PATH = orig_ap
+            config.HISTORY_PATH = orig_hp
+
+    # 5d. 三态历史：UNKNOWN 不能被当成成功，也不能被幂等锁挡住补发
+    with tempfile.TemporaryDirectory(prefix="sb_status_") as d:
+        orig_hp = config.HISTORY_PATH
+        config.HISTORY_PATH = Path(d) / "history.jsonl"
+        try:
+            day = "2026-01-02"
+            config.add_history({"time": day + " 08:00:00", "name": "甲", "ok": False,
+                                "status": "unknown", "detail": "待核对"})
+            config.add_history({"time": day + " 08:01:00", "name": "乙", "ok": True,
+                                "status": "success", "detail": "已发送"})
+            config.add_history({"time": day + " 08:02:00", "name": "丙", "ok": False,
+                                "status": "failed", "detail": "没写进去"})
+            check("UNKNOWN not counted as success", "甲" not in config.today_ok_names(day))
+            check("UNKNOWN listed for manual check", "甲" in config.today_unknown_names(day))
+            check("SUCCESS counted as done", "乙" in config.today_ok_names(day))
+            st = config.latest_today_status(day)
+            check("latest status per target", st["丙"]["status"] == "failed", repr(st))
+        finally:
+            config.HISTORY_PATH = orig_hp
+
+    # 5e. 发送终态状态机：新增气泡不等于成功，未进入终态必须 UNKNOWN
+    check("SendUnknown class available", issubclass(douyin.SendUnknown, Exception))
+    check("anchor selector targets own message", "isFromMe" in douyin.OUTGOING_MSG_SELECTOR)
+    check("failure markers include retry", any("retry" in s.lower()
+          for s in douyin.SEND_FAILURE_SELECTORS))
+    check("pending markers include spinner", any("spin" in s.lower()
+          for s in douyin.SEND_PENDING_SELECTORS))
+    check("normalize strips zero-width", douyin._norm_msg("✨今日\u200b火花+1") == "✨今日火花+1")
 
     # 6. 可选：真实只读检查（不发消息）
     if live:
