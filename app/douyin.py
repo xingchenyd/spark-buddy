@@ -116,8 +116,12 @@ class SendUnknown(Exception):
 # ---- 发送终态确认（移植自 unmev/douyin-auto-fire/app/sender.py 的核心思路）----
 # 关键：锚定「最新一条我方消息」，发送后观察同一条消息的状态变化，
 # 而不是数整页固定文本 / 数消息行总数（虚拟列表与历史加载会让它随机漂移）。
+# 2026-11-17 真实 DOM 实测校正：消息按时间正序排列，最新一条在最底部；
+# 我方消息的标志 class 是 messageMessageBoxisFromMe，容器是 messageMessageBoxmessageBox。
+# 参考项目 unmev/douyin-auto-fire 的 `.messageMessageListlist [data-index='0']` 前缀
+# 在本机抖音版本里匹配数为 0，直接照搬会导致锚点永远找不到 → 全部误判 UNKNOWN。
+# 因此去掉列表前缀，锚点/状态读取统一取「最后一个」匹配元素（=最新我方消息）。
 OUTGOING_MSG_SELECTOR = (
-    ".messageMessageListlist [data-index='0'] "
     ".messageMessageBoxmessageBox:has(.messageMessageBoxcontentBox.messageMessageBoxisFromMe)"
 )
 # 失败标记：红色重试按钮 / 发送失败文案。刻意排除裸 SendStatusicon——
@@ -158,7 +162,9 @@ def _anchor_latest_outgoing(page):
     try:
         return page.evaluate(r"""
 ([attr, selector]) => {
-  const el = document.querySelector(selector);
+  // 消息按时间正序，最新一条在底部 → 取最后一个匹配元素
+  const els = document.querySelectorAll(selector);
+  const el = els.length ? els[els.length - 1] : null;
   if (!el) return ["", ""];
   const content = el.querySelector('[data-e2e="msg-item-content"]') || el;
   const anchor = 'sb' + Math.random().toString(36).slice(2, 12);
@@ -187,7 +193,9 @@ def _outgoing_state(page, anchor, before_html, text, selector=OUTGOING_MSG_SELEC
         return page.evaluate(r"""
 ([attr, selector, anchor, beforeHtml, expected]) => {
   const norm = v => (v || '').replace(/[\s\u200B\u200C\u200D\uFEFF]+/g, ' ').trim();
-  const el = document.querySelector(selector);
+  // 与锚点时一致：取最后一条我方消息（最新），新发出的消息会出现在这个位置
+  const els = document.querySelectorAll(selector);
+  const el = els.length ? els[els.length - 1] : null;
   if (!el) return { new:false, textMatch:false, failed:false, pending:false, text:'' };
   const content = el.querySelector('[data-e2e="msg-item-content"]') || el;
   const html = content.innerHTML || '';
