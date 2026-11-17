@@ -13,6 +13,7 @@
 """
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -21,6 +22,8 @@ sys.path.insert(0, str(ROOT))
 from app import config, douyin, scheduler  # noqa: E402
 
 TEXT = "✨今日火花+1"
+# 贴近 2026-11-17 实测的真实 DOM：侧栏搜索框面积更大，聊天输入框是
+# Slate 编辑器（空状态 innerText 为零宽空格 U+200B），输入区带 messageMsgInput。
 HTML = """<!doctype html><html><body>
 <div data-e2e="im-dialog">
   <div data-stack-layer="chat" id="chat">
@@ -28,7 +31,12 @@ HTML = """<!doctype html><html><body>
     <div class="MessageBoxContentrowBox" style="min-height:22px">✨今日火花+1</div>
     <div class="MessageBoxContentrowBox" style="min-height:22px">✨今日火花+1</div>
   </div>
-  <div contenteditable="true" id="box" style="width:600px;height:44px;border:1px solid #999"></div>
+  <div class="messageMsgInputinputRow">
+    <input class="semi-input" placeholder="搜索" style="width:400px;height:60px;border:1px solid #999">
+    <div id="box" class="zone-container messageEditorinputArea"
+         data-slate-editor="true" data-placeholder="发送消息"
+         contenteditable="true" style="width:146px;height:44px;border:1px solid #999">&#8203;</div>
+  </div>
 </div>
 </body></html>"""
 
@@ -59,8 +67,14 @@ def main(live=False):
 
             # 3. 输入框定位 + 严格写入
             check("input box located", douyin._mark_input_box(page))
+            tagged = page.evaluate(
+                "() => { const e=document.querySelector('[data-sb-input=\"1\"]');"
+                " return e ? (e.getAttribute('data-slate-editor') || e.tagName) : null; }")
+            check("slate editor chosen, not larger search box",
+                  tagged == "true", repr(tagged))
             ok, observed = douyin._type_into_input(page, TEXT)
             check("text strictly written into input", ok and TEXT in (observed or ""), repr(observed))
+            check("duplicate text in input is refused", (observed or "") == TEXT, repr(observed))
 
             # 4. 消息行增量校验
             before = douyin._chat_bubbles(page)
@@ -80,7 +94,7 @@ def main(live=False):
             # 模拟真实发送：输入框清空 + 新增一条我方消息行
             page.evaluate("""(t) => {
               const b = document.querySelector('[data-sb-input="1"]');
-              b.innerText = '';
+              b.innerText = '\\u200b';
               const d = document.createElement('div');
               d.className = 'MessageBoxContentrowBox';
               d.style.minHeight = '22px'; d.innerText = t;
@@ -88,8 +102,17 @@ def main(live=False):
             }""", TEXT)
             after2 = douyin._chat_bubbles(page)
             check("new own bubble => success", douyin._bubble_added(before, after2, TEXT),
-                  "msg=%d->%d" % (len(before), len(after2)))
-            check("input cleared => accepted", (douyin._read_input(page) or "").strip() == "")
+                  "hits=%d->%d" % (sum(1 for x in before if TEXT in x),
+                                   sum(1 for x in after2 if TEXT in x)))
+            # 真实 Slate 空状态是 U+200B，旧版把它当「仍有文本」→ 全判 FAIL
+            check("zero-width Slate empty state is empty",
+                  douyin._input_is_empty(douyin._read_input(page)))
+            # 虚拟列表满窗时总行数不变（旧版 len 比较在此必然漏判）
+            before40 = ["x"] * 37 + [TEXT] * 3
+            after40 = ["x"] * 36 + [TEXT] * 4
+            check("full virtual list still detects new message",
+                  douyin._bubble_added(before40, after40, TEXT))
+            check("input cleared => accepted", (douyin._read_input(page) or "") == "")
             # DOM 重建导致标记丢失时必须返回 None（未知），不能被当成「已清空」
             page.evaluate("""() => document.querySelector('[data-sb-input="1"]')
                                   .removeAttribute('data-sb-input')""")
@@ -102,7 +125,10 @@ def main(live=False):
                 user_data_dir=d, headless=True, executable_path=exe,
                 args=["--no-first-run", "--no-default-browser-check"])
             p = ctx.pages[0] if ctx.pages else ctx.new_page()
-            p.set_content("<html><body><div>no chat here</div></body></html>")
+            p.set_content("<html><body><div>no chat here</div>"
+                          "<input placeholder='搜索' style='width:400px;height:60px'>"
+                          "</body></html>")
+            check("no chat input area => no marking", not douyin._mark_input_box(p))
             ok2, _ = douyin._type_into_input(p, TEXT)
             check("no input box => refuse to send", not ok2)
             ctx.close()
@@ -157,6 +183,24 @@ def main(live=False):
         check("browser lock released after preflight failure", lock_free)
     finally:
         douyin._open = orig_open
+
+    # 5c. 幂等锁：登记过发送动作后，当天绝不执行第二次（2026-11-17 事故回归）
+    with tempfile.TemporaryDirectory(prefix="sb_idem_") as d:
+        orig_ap = config.ATTEMPTS_PATH
+        config.ATTEMPTS_PATH = Path(d) / "attempts.jsonl"
+        try:
+            day = time.strftime("%Y-%m-%d")
+            check("no attempt initially", not config.already_attempted_today("__idem__"))
+            config.record_attempt(day, "__idem__", TEXT)
+            check("attempt recorded", config.already_attempted_today("__idem__"))
+            # _send_once 在触碰任何浏览器对象之前就短路，page=None 也不会被使用
+            ok, detail = douyin._send_once(None, "__idem__", TEXT)
+            check("second send short-circuits before browser",
+                  ok and "跳过" in detail, detail)
+            check("attempted target visible to scheduler",
+                  "__idem__" in config.today_attempted_names(day))
+        finally:
+            config.ATTEMPTS_PATH = orig_ap
 
     # 6. 可选：真实只读检查（不发消息）
     if live:

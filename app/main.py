@@ -207,6 +207,8 @@ def status():
         "browser": douyin.browser_diagnostics(),
         "infra_error": getattr(scheduler, "last_infra_error", ""),
         "code_version": config.CODE_VERSION,
+        # 今天已执行过发送动作的目标数（幂等锁口径，防止失败重试导致重复打扰）
+        "attempted_today": len(config.today_attempted_names(today)),
     }
 
 
@@ -448,7 +450,10 @@ def send_one(body: dict):
     scheduler.task_running = True
     try:
         try:
-            ok, detail = douyin.send_message(name, text)
+            # 手动单独发送默认同样受幂等锁保护；仅当面板显式传 force=true
+            # 才允许当天对同一人重发（用户知情并主动触发）。
+            ok, detail = douyin.send_message(
+                name, text, force=bool(body.get("force")))
         except douyin.InfraError as e:
             # 环境级故障不算这个人的失败，也不写历史；面板给出可操作提示
             scheduler.last_infra_error = str(e)

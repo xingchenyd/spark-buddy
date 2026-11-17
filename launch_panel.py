@@ -33,6 +33,21 @@ _bg.write("\n==== launch_panel start %s ====\n"
 sys.stdout = _bg
 sys.stderr = _bg
 
+# 单实例互斥体：start.bat 的 WMI 创建 + fallback 双启动曾在同一秒拉起两个
+# 面板进程（2026-11-17 实测 pid 21036/27880）。端口检查存在竞态，互斥体没有。
+import ctypes  # noqa: E402
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+_kernel32.CreateMutexW.restype = ctypes.c_void_p
+# 句柄必须存活到进程结束，否则互斥体会提前释放
+_panel_mutex = _kernel32.CreateMutexW(
+    None, False, "Local\\SparkBuddyPanelSingleton")
+if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
+    _bg.write("another panel instance holds the mutex -> exit\n")
+    _bg.flush()
+    sys.exit(0)
+
 from app import config  # noqa: E402  （只依赖标准库，安全）
 
 

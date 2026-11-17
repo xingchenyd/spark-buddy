@@ -114,10 +114,14 @@ def run_daily_task(mark_done=True):
     try:
         cfg = config.load_config()
         today = _today()
-        ok_names = config.today_ok_names(today)
+        # 2026-11-17：以「是否执行过发送动作」为准，而不是「是否校验成功」。
+        # 旧版只看 ok=True，校验层一旦集体误判就会整轮重跑，造成同一人一天
+        # 收到 4 条。结果可以不确定，动作必须最多一次。
+        done = config.today_ok_names(today) | config.today_attempted_names(today)
         targets = [t for t in cfg.get("targets", []) if t.get("enabled", True)]
-        todo = [t for t in targets if t["name"] not in ok_names]
-        _log("start: %d 目标, %d 已发, %d 待发" % (len(targets), len(targets) - len(todo), len(todo)))
+        todo = [t for t in targets if t["name"] not in done]
+        _log("start: %d 目标, %d 今日已处理, %d 待发"
+             % (len(targets), len(targets) - len(todo), len(todo)))
         if not todo:
             if mark_done:
                 config.update_state(last_run_date=today)
@@ -129,8 +133,9 @@ def run_daily_task(mark_done=True):
         last_infra_error = ""
         stat = _send_round(todo, cfg, page)
         if cfg.get("second_round") and stat["ok"]:
-            ok_now = config.today_ok_names(today)
-            failed = [t for t in todo if t["name"] not in ok_now]
+            done_now = (config.today_ok_names(today)
+                        | config.today_attempted_names(today))
+            failed = [t for t in todo if t["name"] not in done_now]
             if failed:
                 _log("second round: 对 %d 个失败目标追加一轮" % len(failed))
                 stat2 = _send_round(failed, cfg, page)

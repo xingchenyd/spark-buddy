@@ -553,28 +553,49 @@ def _chat_view_hint(page):
 # contenteditable」，但抖音聊天层是独立的 data-stack-layer="chat"，
 # 结果 filled=False 出现在**所有**目标上：文本到底进没进输入框从未被确认，
 # 直接按了 Enter，随后又被上面的文本计数随机判成 OK / FAIL。
+# 抖音聊天输入框是 Slate 编辑器：清空后 innerText 是零宽空格 \u200b，
+# 不是空串。2026-11-17 事故即源于把它当成「仍有文本」——导致全部误判 FAIL，
+# 并触发「Enter 后再点发送按钮」的兜底，同一人一天收到 4 条。
+_ZERO_WIDTH = "\u200b\ufeff\u200c\u200d\u2060"
+
+
+def _norm_input(s):
+    """把 Slate 空编辑器状态归一为空串。None 保持 None（DOM 标记丢失=未知）。"""
+    if s is None:
+        return None
+    for ch in _ZERO_WIDTH:
+        s = s.replace(ch, "")
+    return s.strip()
+
+
 def _mark_input_box(page):
-    """给当前聊天主输入框打临时标记，返回是否定位成功。"""
+    """只认聊天窗的 Slate 主输入框，绝不退化到「全页面积最大的可编辑元素」。
+
+    2026-11-17 实测：侧栏搜索框 227x32（面积 7264）比真输入框 146x44
+    （面积 6424）更大，旧版按面积选会在焦点丢失时把消息打进搜索框并按
+    Enter 触发搜索——这就是「很多人没有发送」。
+    """
     try:
         return page.evaluate(r"""
 () => {
   document.querySelectorAll('[data-sb-input]').forEach(e => e.removeAttribute('data-sb-input'));
+  const editorArea = document.querySelector("[class*='messageMsgInput']");
+  if (!editorArea) return false;                 // 聊天输入区不存在 = 会话没打开
   const scope = document.querySelector("[data-e2e='im-dialog']") || document;
-  const sel = "div[contenteditable='true'], textarea, [role='textbox']";
-  const vis = [...scope.querySelectorAll(sel)].filter(e => {
-    const r = e.getBoundingClientRect();
-    return r.width > 60 && r.height >= 14 && r.width < 2000;
-  });
-  if (!vis.length) return false;
-  const active = document.activeElement;
-  const activeBox = active ? active.closest(sel) : null;
-  let best = (activeBox && vis.includes(activeBox)) ? activeBox : null;
-  if (!best) {
-    let area = 0;
-    for (const e of vis) {
+  const sels = [
+    "div[data-slate-editor='true'][contenteditable='true']",
+    "div[contenteditable='true'][data-placeholder='发送消息']",
+    "[class*='messageEditorinputArea'][contenteditable='true']",
+    "[class*='messageMsgInput'] div[contenteditable='true']",
+    "[class*='messageMsgInput'] textarea"
+  ];
+  let best = null;
+  for (const s of sels) {
+    for (const e of scope.querySelectorAll(s)) {
       const r = e.getBoundingClientRect();
-      if (r.width * r.height > area) { area = r.width * r.height; best = e; }
+      if (r.width > 40 && r.height >= 14) { best = e; break; }
     }
+    if (best) break;
   }
   if (!best) return false;
   best.setAttribute('data-sb-input', '1');
@@ -586,37 +607,43 @@ def _mark_input_box(page):
 
 
 def _read_input(page):
-    """返回输入框文本；None = 标记已随 DOM 重建丢失（未知，不可当作已清空）。"""
+    """返回归一化后的输入框文本；None = 标记随 DOM 重建丢失（未知，不可当作已清空）。"""
     try:
-        return page.evaluate(r"""
+        return _norm_input(page.evaluate(r"""
 () => {
   const e = document.querySelector('[data-sb-input="1"]');
   if (!e) return null;
   if (e.tagName === 'TEXTAREA' || e.tagName === 'INPUT') return e.value || '';
   return e.innerText || '';
 }
-""")
+"""))
     except Exception:
         return None
 
 
+def _input_is_empty(cur):
+    return cur is not None and cur == ""
+
+
 def _chat_bubbles(page):
-    """当前聊天窗消息行文本（尾部 40 条）。用于判断「新增我方消息」。
-    MessageBoxContentrowBox 是抖音消息行的真实 class（失败截图 call log 实锤）。"""
+    """当前聊天窗消息行文本（尾部 80 条）。范围限定聊天层，避免把会话列表
+    预览、主站评论等同样带固定文案的节点算进来。"""
     try:
         return page.evaluate(r"""
 () => {
+  const scope = document.querySelector("[data-stack-layer='chat']") ||
+                document.querySelector("[data-e2e='im-dialog']") || document;
   const sels = ["[class*='MessageBoxContentrowBox']", "[data-e2e='message-item']",
                 "[class*='messageItem']", "[class*='MessageItem']",
                 "[data-e2e='chat-message']", "[class*='message-row']"];
   let best = [];
   for (const s of sels) {
-    const ns = [...document.querySelectorAll(s)]
+    const ns = [...scope.querySelectorAll(s)]
       .filter(e => e.getBoundingClientRect().height > 8)
       .map(e => (e.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200));
     if (ns.length > best.length) best = ns;
   }
-  return best.slice(-40);
+  return best.slice(-80);
 }
 """)
     except Exception:
@@ -624,15 +651,17 @@ def _chat_bubbles(page):
 
 
 def _bubble_added(before, after, text):
-    """是否出现新增的、包含目标文本的消息行（不依赖历史文本计数）。
+    """「含目标文本的消息行数」是否增加。
 
-    消息行数量没有增加时一律判 False——历史消息本来就含同样的固定文本，
-    若只看「尾部有没有 text」会把旧消息误当成刚发出的新消息（假成功）。
+    2026-11-17 修正：旧版用 len(after) > len(before) + 取尾部切片，但
+    ① 尾部 40 条截断会让满窗时长度恒为 40；② MessageBoxContentrowBox 还
+    匹配时间、昵称、空行；③ 虚拟列表会卸载旧行使总行数减少（日志里的
+    msg=34->31）。只数「含目标文本的行」才能稳定反映新发出了一条。
     """
-    if not after or len(after) <= len(before):
+    if not after:
         return False
-    tail = after[len(before):]
-    return any(text in t for t in tail)
+    return (sum(1 for t in after if text in t)
+            > sum(1 for t in before if text in t))
 
 
 def _type_into_input(page, text):
@@ -656,7 +685,9 @@ def _type_into_input(page, text):
         page.keyboard.insert_text(text)
         page.wait_for_timeout(350)
         observed = _read_input(page)
-        if observed is not None and text.strip() in observed.strip():
+        # 严格相等：Slate 里 Ctrl+A 未生效时会把文本追加到旧内容后面，
+        # 一次发送夹带两遍文案。宁可判失败不重发，也不能发出重复内容。
+        if observed is not None and observed == text.strip():
             return True, observed
         _log("input attempt %d/3: observed=%r" % (attempt + 1, observed))
     return False, observed
@@ -1534,16 +1565,22 @@ def enrich_uid(items):
     return out
 
 
-def _send_once(page, name, text):
-    """单次发送（复用调用方已打开的 page）。返回 (ok, detail)。
+def _send_once(page, name, text, force=False):
+    """单次发送。返回 (ok, detail)。
 
-    2026-11-16 重写：
-    1) 先严格确认文本真的进了输入框，写不进去绝不按 Enter。旧版 filled=False
-       出现在所有目标上，等于大量「空发」被随机判成成功或失败；
-    2) 校验只看「输入框被清空」与「新增我方消息行」，废除整页固定文本计数
-       （每天内容相同，历史消息/会话预览/虚拟列表让计数随机漂移）；
-    3) InfraError 向上抛，由调度层整轮短路，不再逐个消耗目标。
+    2026-11-17 重写，修复「同一人一天收到 4 条 / 部分人没发」：
+    1) 幂等锁：按下 Enter **之前**先落盘登记发送动作。之后无论校验成功、
+       失败还是进程崩溃，当天都不会再对该目标执行第二次发送动作；
+    2) 输入框只认聊天窗 Slate 编辑器，空状态零宽空格按「已清空」处理；
+    3) 删除「Enter 后输入框仍有文本就再点一次发送按钮」的兜底——它是
+       重复投递的直接推手，且实测 Enter 本身已能把消息发出去；
+    4) 成功判据：输入框清空 或 含目标文本的消息行数增加。
     """
+    day = datetime.now().strftime("%Y-%m-%d")
+    if not force and config.already_attempted_today(name):
+        _log("send_message -> %s SKIP (already attempted today)" % name)
+        return True, "今日已发送过，跳过（幂等保护，避免重复打扰）"
+
     try:
         _ensure_conversation_list(page)
         if not has_session_cookie(_context):
@@ -1551,54 +1588,47 @@ def _send_once(page, name, text):
         _find_and_open_conversation(page, name)
         page.wait_for_timeout(400)
 
+        # 会话没真正打开时页面仍可能残留主站的搜索框/评论框。
+        # 此处必须失败退出，绝不把文本写进别的输入框再按 Enter。
+        if not _mark_input_box(page):
+            raise SendFailed("聊天输入框未就绪（会话可能未正确打开），未执行发送")
+
         typed_ok, observed = _type_into_input(page, text)
         if not typed_ok:
             raise SendFailed("文本未能写入聊天输入框（未执行发送，避免空发）；观察到 %r" % observed)
 
         before = _chat_bubbles(page)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(500)
-        # 仅当 Enter 没发出去（输入框仍有文本）才点发送按钮兜底
-        cur = _read_input(page)
-        if cur is not None and cur.strip():
-            btn = _first_visible(page, SEND_BUTTON_SELECTORS, timeout=1000)
-            if btn is not None:
-                try:
-                    btn.click(force=True, timeout=2000)
-                except Exception:
-                    pass
+        before_hits = sum(1 for t in before if text in t)
 
-        # 12s 校验窗口：输入框清空（客户端已接受）或新增我方消息行
+        # 幂等登记：放在发送动作之前的最后一步。
+        config.record_attempt(day, name, text)
+        page.keyboard.press("Enter")
+
         cleared_streak = 0
-        bubble_seen = False
         samples = []
         for _ in range(24):
             page.wait_for_timeout(500)
             cur = _read_input(page)
+            if cur is None:
+                # DOM 重建导致标记丢失：重新定位后再读，不能当成「已清空」
+                _mark_input_box(page)
+                cur = _read_input(page)
             after = _chat_bubbles(page)
-            empty = cur is not None and cur.strip() == ""
+            hits = sum(1 for t in after if text in t)
+            empty = _input_is_empty(cur)
             cleared_streak = cleared_streak + 1 if empty else 0
             if len(samples) < 8:
-                samples.append("in=%s,msg=%d->%d"
+                samples.append("in=%s,hit=%d->%d"
                                % ("E" if empty else ("F" if cur is not None else "?"),
-                                  len(before), len(after)))
-            if _bubble_added(before, after, text):
-                bubble_seen = True
-                # 气泡 + 输入框已清空（或 DOM 重建导致状态未知）才直接判成功，
-                # 避免虚拟列表异步补载历史消息时把旧的同文消息当成刚发出的。
-                if empty or cur is None:
-                    _log("send_message -> %s OK (new bubble)" % name)
-                    return True, "已发送（确认到新消息气泡）"
+                                  before_hits, hits))
+            if hits > before_hits:
+                _log("send_message -> %s OK (new own message)" % name)
+                return True, "已发送（聊天窗确认到新消息）"
             if cleared_streak >= 2:
                 _log("send_message -> %s OK (input cleared)" % name)
                 return True, "已发送（输入框已清空，客户端已接受发送）"
-        if bubble_seen:
-            # 气泡出现过但输入框始终未确认清空：记为成功但在详情里标注待核对，
-            # 不再像旧版那样武断判失败（用户手机已收到却被记 FAIL）。
-            _log("send_message -> %s OK (bubble seen, input state unknown)" % name)
-            return True, "已发送（见到新消息气泡，输入框状态未确认，建议核对）"
         tail = _dialog_tail_hint(page)
-        raise SendFailed("发送后 12s 内输入框未清空且未见新消息气泡；采样: %s"
+        raise SendFailed("发送后 12s 内未确认到新消息（已登记发送动作，今天不会自动重发）；采样: %s"
                          % "; ".join(samples)
                          + ("；页面尾部: %s" % tail if tail else ""))
     except InfraError:
@@ -1652,14 +1682,17 @@ def end_batch():
         pass
 
 
-def send_message(name, text, page=None):
+def send_message(name, text, page=None, force=False):
     """给 name 发送一条 text。返回 (ok, detail)。
-    page 非空时复用批次浏览器（整轮只开一次）；为空时自行开关一次。"""
+
+    page 非空时复用批次浏览器；force=True 仅用于用户明确要求的手动强制重发，
+    正常调度一律走幂等锁（当天最多一次发送动作）。
+    """
     if page is not None:
-        return _send_once(page, name, text)
+        return _send_once(page, name, text, force=force)
     with _BROWSER_LOCK:
         p = _open(headless=False)
         try:
-            return _send_once(p, name, text)
+            return _send_once(p, name, text, force=force)
         finally:
             _close()

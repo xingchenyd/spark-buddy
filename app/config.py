@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -13,13 +14,17 @@ BROWSER_DATA = BASE / "browser_data"
 CONFIG_PATH = DATA / "config.json"
 STATE_PATH = DATA / "state.json"
 HISTORY_PATH = DATA / "history.jsonl"
+# 发送动作流水（幂等锁）：记录「确实按下了发送键」这一事实，与发送结果无关。
+# 2026-11-17 事故：校验层误判成功为失败后，调度器反复整轮重试，同一个好友
+# 一天收到 4 条。结果可以不确定，但「发过没有」必须确定且只记一次。
+ATTEMPTS_PATH = DATA / "send_attempts.jsonl"
 
 _lock = threading.Lock()
 
 # 面板代码版本（构建序号 YYYYMMDD+当日两位序号）：每次改动代码必须 bump。
 # 双击启动器据此自动替换旧面板（2026-10-18）；面板心跳每分钟自检磁盘版本，
 # 发现自己过时且空闲时自动拉起新版完成热替换，无需用户手动重启（2026-10-19）。
-CODE_VERSION = 2026111601
+CODE_VERSION = 2026111701
 
 ALIVE_PATH = DATA / "panel_alive.json"
 # 项目私有 Playwright 浏览器目录：与全局 %LOCALAPPDATA%\ms-playwright 隔离，
@@ -153,3 +158,34 @@ def today_ok_names(today_str):
         if e.get("time", "").startswith(today_str) and e.get("ok"):
             names.add(e.get("name"))
     return names
+
+
+# ---- 幂等锁：以「发送动作」而不是「发送结果」为准 ----
+def record_attempt(day, name, text=""):
+    """在按下 Enter 之前登记。写入后无论校验成功、失败或崩溃，今天都不再重发。"""
+    with _lock:
+        with open(ATTEMPTS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"day": day, "name": name, "text": text,
+                                "ts": time.time()}, ensure_ascii=False) + "\n")
+            f.flush()
+
+
+def today_attempted_names(day):
+    """今天已经执行过发送动作的目标集合。"""
+    names = set()
+    if not ATTEMPTS_PATH.exists():
+        return names
+    with _lock:
+        with open(ATTEMPTS_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if e.get("day") == day:
+                        names.add(e.get("name"))
+                except Exception:
+                    pass
+    return names
+
+
+def already_attempted_today(name):
+    return name in today_attempted_names(time.strftime("%Y-%m-%d"))
