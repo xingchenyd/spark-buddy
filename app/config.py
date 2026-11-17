@@ -19,9 +19,26 @@ _lock = threading.Lock()
 # 面板代码版本（构建序号 YYYYMMDD+当日两位序号）：每次改动代码必须 bump。
 # 双击启动器据此自动替换旧面板（2026-10-18）；面板心跳每分钟自检磁盘版本，
 # 发现自己过时且空闲时自动拉起新版完成热替换，无需用户手动重启（2026-10-19）。
-CODE_VERSION = 2026102002
+CODE_VERSION = 2026111601
 
 ALIVE_PATH = DATA / "panel_alive.json"
+# 项目私有 Playwright 浏览器目录：与全局 %LOCALAPPDATA%\ms-playwright 隔离，
+# 避免别的项目升级/清理缓存时把本项目需要的 chromium-xxxx 删掉（2026-11-16 事故根因）。
+BROWSERS_DIR = BASE / ".pw-browsers"
+BROWSER_EXE_PATH = DATA / "browser_exe.json"
+
+
+def load_browser_exe():
+    """上次实际使用的浏览器路径。固定复用同一个 exe，避免持久化 Profile
+    在高/低版本 Chromium 之间来回升级而损坏登录态。"""
+    return _read_json(BROWSER_EXE_PATH, {}).get("exe", "")
+
+
+def save_browser_exe(exe):
+    try:
+        _write_json(BROWSER_EXE_PATH, {"exe": str(exe), "saved_at": __import__("time").time()})
+    except Exception:
+        pass
 
 
 def load_alive():

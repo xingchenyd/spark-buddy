@@ -14,3 +14,6 @@ __pycache__/
 *.log
 *.tmp
 *.upload_bak
+
+# project-private Playwright browser cache (large binary files)
+.pw-browsers/

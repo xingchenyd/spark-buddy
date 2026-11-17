@@ -42,7 +42,9 @@
 
 - **登录判定用 cookie，不看页面 DOM**：以 `sessionid` cookie 是否存在判断登录态，抖音页面改版不影响登录检测。
 - **发送走真实浏览器**（Playwright + 持久化 Chromium Profile），不用任何协议逆向，风控风险最低。
-- **发送强校验**：输入 → 回车 → 等待消息气泡真实出现 → 才记成功；每一步失败都有明确原因。
+- **发送强校验（2026-11-16 重写）**：先严格确认文本确实写入输入框，写不进去就不按回车；发送后以「输入框被清空」或「新增我方消息行」判成功。旧的「整页固定文本出现次数」方案会因历史消息、会话预览、虚拟列表异步渲染而随机漂移，同时制造假成功和假失败，已废弃。
+- **基础设施故障短路**：浏览器缺失 / 网络不通 / 登录失效时整轮立即中止，不逐个消耗目标、不写假失败、不把当天标记成已跑；退避 5 分钟后自动重试，只补今天尚未成功的目标。
+- **整轮只启动一次浏览器**：旧版每发一个目标都冷启动一次 Chromium 并等 30 秒侧栏，10 个目标就是 10 个失败窗口；现在批次内复用同一上下文。
 - **短路径 DOM 操作**：定位会话和输入框的 selector 全部写成候选链，集中在 `app/douyin.py` 顶部，页面改版只需改一处。
 
 ## 📦 安装（Windows）
@@ -62,6 +64,7 @@ start.bat     :: 以后每天双击这个：启动面板并自动打开浏览器
 ```bat
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.org/simple
+set PLAYWRIGHT_BROWSERS_PATH=%CD%\.pw-browsers
 .venv\Scripts\python.exe -m playwright install chromium
 .venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 ```
@@ -86,12 +89,39 @@ python -m venv .venv
 | `data/config.json` | 发送时间、消息内容、目标列表 | 一般 |
 | `data/state.json` | 当日调度状态（今天是否已发） | 一般 |
 | `data/history.jsonl` | 发送历史（时间/对象/结果/原因） | 含好友昵称 |
+| `data/browser_exe.json` | 上次实际使用的浏览器路径（固定复用，避免 Profile 跨版本来回升级） | 一般 |
 | `logs/app.log` | 运行日志 | 一般 |
 | `browser_data/` | **浏览器登录态（含 session cookie）** | ⚠️ **高度敏感，勿外传** |
+| `.pw-browsers/` | 项目私有 Chromium（约 150MB，与全局缓存隔离） | 无 |
 
 以上目录均已加入 `.gitignore`，不会被提交到仓库。**换电脑时把整个项目目录拷过去即可无缝续用**（或至少带走 `browser_data/` 和 `data/`）。
 
+### 自检（不发送任何消息）
+
+```bat
+.venv\Scripts\python.exe selftest.py          :: 离线 + 浏览器启动，约 10 秒
+.venv\Scripts\python.exe selftest.py --live   :: 追加只读打开消息中心，约 1 分钟
+```
+
+自检覆盖浏览器自动发现、持久化上下文启动、输入框严格写入、消息行增量校验、基础设施故障短路与浏览器锁释放。任何一项 FAIL 都不建议直接跑正式发送。
+
 ## ❓ 常见问题
+
+<details>
+<summary><b>所有目标同一天一起失败，或报 "Executable doesn't exist at chromium-1194"</b></summary>
+
+这是 2026-11-16 修复的根因：Playwright 默认从**全局共享缓存** `%LOCALAPPDATA%\ms-playwright` 按固定 revision 找浏览器，其它项目升级 Playwright 或清理缓存会把它删掉。此时每个目标必然失败，旧版还会把失败写进历史并把当天标记成「已跑」，导致当天再也不会自动补发。
+
+现在的处理：浏览器装进项目私有 `.pw-browsers/`，启动时自动发现私有缓存 / 全局缓存 / 系统 Edge 或 Chrome 中可用的最新版本并显式传给 Playwright；彻底找不到会自动下载；并把实际使用的路径记在 `data/browser_exe.json` 固定复用（避免持久化 Profile 跨版本来回升级）。
+
+遇到这个提示先跑 `selftest.py`；若仍失败，重新执行一次 `install.bat` 即可。环境恢复后会自动补发今天尚未成功的目标，无需手动点「立即发送」。
+</details>
+
+<details>
+<summary><b>面板状态里出现「环境未就绪」</b></summary>
+
+说明浏览器 / 网络 / 登录态三者之一异常。此时**没有发送、也没有写入失败历史**，面板会退避 5 分钟自动重试。可在 `/api/status` 的 `browser`、`infra_error` 字段看到具体原因；对应处理依次是：跑 `install.bat`、检查网络或代理、点「扫码登录」。
+</details>
 
 <details>
 <summary><b>提示"找不到会话 ××"</b></summary>

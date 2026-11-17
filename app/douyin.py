@@ -3,13 +3,18 @@
 设计原则：
 - 登录只用"手机扫码"，登录态存在 browser_data 持久化目录，一次登录长期复用；
 - 是否已登录用 cookie（sessionid / sessionid_ss）判断，不依赖页面 DOM，最可靠；
-- 发消息走真实浏览器 + 强校验（会话点开输入框出现 + 发送后消息气泡出现），失败自动重试；
+- 发消息走真实浏览器 + 强校验（文本严格写入输入框 → 发送后输入框清空或新增
+  我方消息行）；基础设施级故障整轮短路并自动延后重试，不产生假失败记录；
 - 会话定位用官方 data-e2e 锚点（im-entry / im-dialog / conversation-item），
   搜索兜底只允许侧栏内部搜索框，绝不触碰主站顶部搜索框；
 - user_data_dir 同一时刻只能被一个浏览器实例占用，全部会话经 _BROWSER_LOCK 串行化。
 """
+import json
+import os
 import random
 import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -17,6 +22,13 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import config
+
+# Playwright 的浏览器默认装在全局 %LOCALAPPDATA%\ms-playwright，任何其它项目
+# 升级 playwright 或清理缓存都可能删掉本项目锁定的 chromium-1194。
+# 2026-11-16 事故即由此引起：本机只剩 chromium-1248，1.56.0 却硬找 1194，
+# 当天 10 个目标全部报 "Executable doesn't exist" 并被写成失败、还把当天标记成已跑。
+# 现在统一改为：浏览器装到项目私有目录 + 显式 executable_path 自动发现可用浏览器。
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(config.BROWSERS_DIR)
 
 # 2026-10: im.douyin.com 已被抖音下线（权威 DNS NXDOMAIN）。
 # 登录入口改用创作者平台（未登录会自动渲染扫码层）；发消息走主站消息中心。
@@ -70,12 +82,124 @@ _login_nickname = ""
 AVATAR_HARVEST = {}
 
 
-class NotLoggedIn(Exception):
+class InfraError(Exception):
+    """基础设施级故障：浏览器不可用 / 网络不通 / 登录态失效。
+
+    这类故障对所有目标都是必然失败。旧版让它逐个跑完 10 个目标、每个都写一条
+    FAIL，最后还把 last_run_date 标成今天，导致当天再也不会自动补发——
+    2026-10-23 / 11-02 / 11-16 三次全军覆没都是这个放大机制造成的。
+    现在统一由调度层短路：不消耗目标、不写失败历史、不标记当天已跑，
+    环境恢复后自动补跑未完成的目标。
+    """
+    pass
+
+
+class NotLoggedIn(InfraError):
     pass
 
 
 class SendFailed(Exception):
     pass
+
+
+# ---- 浏览器可执行文件自动发现（不再绑定单一 revision）----
+_GLOBAL_PW_DIRS = [
+    Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright",
+    Path.home() / "AppData" / "Local" / "ms-playwright",
+]
+_SYSTEM_BROWSERS = [
+    Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+    Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+    Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+    Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+]
+_browser_exe_cache = None
+_browser_lock = threading.Lock()
+
+
+def _scan_pw_browsers():
+    """扫描项目私有 + 全局 Playwright 缓存，返回 [(revision, exe)]，新版本优先。"""
+    out = []
+    roots = [config.BROWSERS_DIR] + list(_GLOBAL_PW_DIRS)
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key in seen or not root or not root.is_dir():
+            continue
+        seen.add(key)
+        try:
+            for d in root.iterdir():
+                if not d.is_dir() or not d.name.startswith("chromium-"):
+                    continue
+                if "headless" in d.name:      # headless shell 不能开可见窗口
+                    continue
+                m = re.search(r"chromium-(\d+)", d.name)
+                rev = int(m.group(1)) if m else 0
+                for sub in ("chrome-win64", "chrome-win", "chrome-linux64", "chrome-linux"):
+                    cand = d / sub / ("chrome.exe" if os.name == "nt" else "chrome")
+                    if cand.is_file():
+                        out.append((rev, cand))
+                        break
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: -x[0])
+
+
+def _auto_install_browser():
+    """兜底：把匹配当前 playwright 版本的 chromium 装进项目私有目录。"""
+    py = config.BASE / ".venv" / "Scripts" / "python.exe"
+    if not py.is_file():
+        py = Path(sys.executable)
+    env = dict(os.environ)
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(config.BROWSERS_DIR)
+    try:
+        r = subprocess.run(
+            [str(py), "-m", "playwright", "install", "chromium"],
+            env=env, cwd=str(config.BASE), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=420, text=True, errors="replace")
+        _log("auto-install chromium rc=%s tail=%s"
+             % (r.returncode, (r.stdout or "")[-260:].replace("\n", " ")))
+        return r.returncode == 0
+    except Exception as e:
+        _log("auto-install chromium error: %r" % e)
+        return False
+
+
+def ensure_browser_exe(force=False):
+    """返回可启动的 Chromium/Edge；彻底找不到时抛 InfraError（由调度层短路）。"""
+    global _browser_exe_cache
+    with _browser_lock:
+        if not force and _browser_exe_cache and Path(_browser_exe_cache).is_file():
+            return _browser_exe_cache
+        # 上次实际用过的 exe 优先：持久化 Profile 不应在不同 Chromium 版本间来回升级
+        last = config.load_browser_exe()
+        if last and Path(last).is_file():
+            _browser_exe_cache = last
+            return last
+        cands = _scan_pw_browsers()
+        if not cands and _auto_install_browser():
+            cands = _scan_pw_browsers()
+        if not cands:
+            for p in _SYSTEM_BROWSERS:
+                if p.is_file():
+                    cands.append((0, p))
+                    break
+        if not cands:
+            raise InfraError("找不到可用的 Chromium/Edge 浏览器，请运行 install.bat")
+        exe = str(cands[0][1])
+        _browser_exe_cache = exe
+        config.save_browser_exe(exe)
+        _log("ensure_browser: %s (rev %s)" % (exe, cands[0][0]))
+        return exe
+
+
+def browser_diagnostics():
+    """供面板 /api/status 展示：浏览器是否就绪、用的是哪一个。"""
+    try:
+        exe = ensure_browser_exe()
+        return {"ok": True, "exe": exe, "private_dir": str(config.BROWSERS_DIR)}
+    except InfraError as e:
+        return {"ok": False, "error": str(e)}
 
 
 def login_flow(max_wait_seconds=600):
@@ -141,6 +265,10 @@ def _new_context(pw, headless=False, window_pos=WIN_OFFSCREEN):
         locale="zh-CN",
         timezone_id="Asia/Shanghai",
         viewport=None,
+        timeout=60000,
+        # 关键：显式指定实际存在的浏览器，playwright 不再按内置 revision
+        # 去硬找 chromium-1194（那个目录一旦被外部清理就全盘失败）。
+        executable_path=ensure_browser_exe(),
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
@@ -158,8 +286,15 @@ def _open(headless=False, window_pos=WIN_OFFSCREEN):
     # playwright 导入较重（冷启动可占数秒），延迟到真正需要浏览器时再加载
     from playwright.sync_api import sync_playwright
 
-    _playwright = sync_playwright().start()
-    _context = _new_context(_playwright, headless=headless, window_pos=window_pos)
+    try:
+        _playwright = sync_playwright().start()
+        _context = _new_context(_playwright, headless=headless, window_pos=window_pos)
+    except InfraError:
+        raise
+    except Exception as e:
+        _close()
+        # 浏览器起不来 = 所有目标必然失败，必须整轮短路
+        raise InfraError("浏览器启动失败: %s" % str(e).split("\n")[0]) from e
     _page = _context.pages[0] if _context.pages else _context.new_page()
     _page.set_default_timeout(15000)
     return _page
@@ -413,54 +548,118 @@ def _chat_view_hint(page):
     return ""
 
 
-def _dialog_text_count(page, text):
-    """数 im-dialog 的 innerText 里出现 text 的次数。
-    比 get_by_text 抗造：emoji 被拆成多个 DOM 节点、渲染时机差异都兼容
-    （2026-10-16 许亦瑶/它叫多多实际已发送却被判失败的误报即源于此）。"""
+# ---- 2026-11-16 重写：输入框状态机 + 消息气泡增量校验 ----
+# 旧版 _input_box_text 只在 im-dialog 内找「宽>200 且 18<=高<300 的
+# contenteditable」，但抖音聊天层是独立的 data-stack-layer="chat"，
+# 结果 filled=False 出现在**所有**目标上：文本到底进没进输入框从未被确认，
+# 直接按了 Enter，随后又被上面的文本计数随机判成 OK / FAIL。
+def _mark_input_box(page):
+    """给当前聊天主输入框打临时标记，返回是否定位成功。"""
     try:
-        return page.evaluate(
-            r"""
-(t) => {
-  const dlg = document.querySelector("[data-e2e='im-dialog']");
-  if (!dlg) return -1;
-  const s = dlg.innerText || '';
-  return s.split(t).length - 1;
-}
-""",
-            text,
-        )
-    except Exception:
-        return -1
-
-
-def _input_box_text(page):
-    """取聊天主输入框的当前文本（im-dialog 内面积最大的「大块」可见 contenteditable）。
-    返回 None=找不到输入框（DOM 重建中/视图切换），''=空，其他=文本内容。
-    2026-10-20 重写清空判定：旧版要求 im-dialog 内全部 contenteditable 都空才算
-    清空，会被表情面板/搜索框等无关可编辑元素拖累而永远判 False（当天它叫多多
-    实际已送达却被误报失败）。现在只盯主输入框本身。"""
-    try:
-        return page.evaluate(
-            r"""
+        return page.evaluate(r"""
 () => {
-  const dlg = document.querySelector("[data-e2e='im-dialog']");
-  if (!dlg) return null;
-  const boxes = dlg.querySelectorAll("div[contenteditable='true']");
-  let best = null, bestArea = 0;
-  for (const b of boxes) {
-    const r = b.getBoundingClientRect();
-    if (r.width > 200 && r.height >= 18 && r.height < 300) {
-      const area = r.width * r.height;
-      if (area > bestArea) { bestArea = area; best = b; }
+  document.querySelectorAll('[data-sb-input]').forEach(e => e.removeAttribute('data-sb-input'));
+  const scope = document.querySelector("[data-e2e='im-dialog']") || document;
+  const sel = "div[contenteditable='true'], textarea, [role='textbox']";
+  const vis = [...scope.querySelectorAll(sel)].filter(e => {
+    const r = e.getBoundingClientRect();
+    return r.width > 60 && r.height >= 14 && r.width < 2000;
+  });
+  if (!vis.length) return false;
+  const active = document.activeElement;
+  const activeBox = active ? active.closest(sel) : null;
+  let best = (activeBox && vis.includes(activeBox)) ? activeBox : null;
+  if (!best) {
+    let area = 0;
+    for (const e of vis) {
+      const r = e.getBoundingClientRect();
+      if (r.width * r.height > area) { area = r.width * r.height; best = e; }
     }
   }
-  if (!best) return null;
-  return (best.innerText || '');
+  if (!best) return false;
+  best.setAttribute('data-sb-input', '1');
+  return true;
 }
-"""
-        )
+""")
+    except Exception:
+        return False
+
+
+def _read_input(page):
+    """返回输入框文本；None = 标记已随 DOM 重建丢失（未知，不可当作已清空）。"""
+    try:
+        return page.evaluate(r"""
+() => {
+  const e = document.querySelector('[data-sb-input="1"]');
+  if (!e) return null;
+  if (e.tagName === 'TEXTAREA' || e.tagName === 'INPUT') return e.value || '';
+  return e.innerText || '';
+}
+""")
     except Exception:
         return None
+
+
+def _chat_bubbles(page):
+    """当前聊天窗消息行文本（尾部 40 条）。用于判断「新增我方消息」。
+    MessageBoxContentrowBox 是抖音消息行的真实 class（失败截图 call log 实锤）。"""
+    try:
+        return page.evaluate(r"""
+() => {
+  const sels = ["[class*='MessageBoxContentrowBox']", "[data-e2e='message-item']",
+                "[class*='messageItem']", "[class*='MessageItem']",
+                "[data-e2e='chat-message']", "[class*='message-row']"];
+  let best = [];
+  for (const s of sels) {
+    const ns = [...document.querySelectorAll(s)]
+      .filter(e => e.getBoundingClientRect().height > 8)
+      .map(e => (e.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200));
+    if (ns.length > best.length) best = ns;
+  }
+  return best.slice(-40);
+}
+""")
+    except Exception:
+        return []
+
+
+def _bubble_added(before, after, text):
+    """是否出现新增的、包含目标文本的消息行（不依赖历史文本计数）。
+
+    消息行数量没有增加时一律判 False——历史消息本来就含同样的固定文本，
+    若只看「尾部有没有 text」会把旧消息误当成刚发出的新消息（假成功）。
+    """
+    if not after or len(after) <= len(before):
+        return False
+    tail = after[len(before):]
+    return any(text in t for t in tail)
+
+
+def _type_into_input(page, text):
+    """严格确认 text 真的写进了输入框；写不进去就不允许按 Enter。"""
+    observed = None
+    for attempt in range(3):
+        if not _mark_input_box(page):
+            page.wait_for_timeout(400)
+            continue
+        box = page.locator("[data-sb-input='1']").first
+        try:
+            box.click(timeout=2500)
+        except Exception:
+            try:
+                box.click(force=True, timeout=1500)
+            except Exception:
+                pass
+        page.wait_for_timeout(150)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.insert_text(text)
+        page.wait_for_timeout(350)
+        observed = _read_input(page)
+        if observed is not None and text.strip() in observed.strip():
+            return True, observed
+        _log("input attempt %d/3: observed=%r" % (attempt + 1, observed))
+    return False, observed
 
 
 def _dialog_tail_hint(page):
@@ -482,26 +681,32 @@ def _dialog_tail_hint(page):
 
 def _open_via_sidebar_search(page, name):
     """在消息侧栏内部搜索并点开会话（绝不碰主站顶部搜索框）。
-    结果项带「发消息」按钮时点按钮直达聊天；成功打开聊天窗返回 True。"""
+
+    2026-11-16 修复：旧版 search.click() 在聊天层（MessageBoxContentrowBox /
+    data-stack-layer="chat"）盖住搜索框时固定吃满 15s actionability 超时，
+    信号3 兜底因此几乎总是失败。改用 focus()+fill() 绕过指针遮挡，
+    所有点击改为 force + 短超时，失败快速返回而不是卡住整轮。
+    """
     search = _first_visible(page, SIDEBAR_SEARCH_SELECTORS, timeout=2000)
     if search is None:
         _log("sidebar search: no search box found")
         return False
     try:
-        search.click()
-        search.fill(name)
+        try:
+            search.focus(timeout=2000)
+        except Exception:
+            search.click(force=True, timeout=2000)
+        search.fill(name, timeout=3000)
         page.keyboard.press("Enter")
-        page.wait_for_timeout(2200)
-        # 结果项（SearchPanelitembox）：昵称 | 火花数 | 发消息
+        page.wait_for_timeout(1800)
         dlg = page.locator(IM_DIALOG).first
         try:
             btns = dlg.get_by_text("发消息", exact=True)
             for i in range(min(btns.count(), 5)):
                 btn = btns.nth(i)
                 try:
-                    if not btn.is_visible(timeout=500):
+                    if not btn.is_visible(timeout=400):
                         continue
-                    # 确认按钮所在结果项的文本以目标昵称开头
                     holder = btn
                     matched = False
                     for _ in range(4):
@@ -513,33 +718,31 @@ def _open_via_sidebar_search(page, name):
                         if len(t) > 60:
                             break
                     if matched:
-                        _harvest_item_avatar(holder, name)   # 顺手抓头像
-                        btn.click()
-                        page.wait_for_timeout(1500)
-                        if _wait_chat_input(page, 6000) is not None:
+                        _harvest_item_avatar(holder, name)
+                        btn.click(force=True, timeout=2500)
+                        page.wait_for_timeout(1200)
+                        if _wait_chat_input(page, 4000) is not None:
                             return True
                 except Exception:
                     continue
         except Exception as e:
             _log("sidebar search send-btn error: %r" % e)
-        # 结果优先按会话项匹配
         item = _match_conversation_item(page, name)
         if item is not None:
             _harvest_item_avatar(item, name)
-            item.click()
-            page.wait_for_timeout(1200)
-            if _wait_chat_input(page, 6000) is not None:
+            item.click(force=True, timeout=2500)
+            page.wait_for_timeout(1000)
+            if _wait_chat_input(page, 4000) is not None:
                 return True
-        # 侧栏内文本兜底（搜索结果/联系人卡片）
         try:
             cand = dlg.get_by_text(name, exact=True)
             for i in range(min(cand.count(), 5)):
                 el = cand.nth(i)
                 try:
                     if el.is_visible():
-                        el.click()
-                        page.wait_for_timeout(1200)
-                        if _wait_chat_input(page, 6000) is not None:
+                        el.click(force=True, timeout=2000)
+                        page.wait_for_timeout(1000)
+                        if _wait_chat_input(page, 4000) is not None:
                             return True
                 except Exception:
                     continue
@@ -556,7 +759,7 @@ def _find_and_open_conversation(page, name):
     hint = ""
     item = _wait_conversation_item(page, name, timeout_s=10)
     if item is not None:
-        _harvest_item_avatar(item, name)   # 顺手抓头像（发送结束统一写回配置）
+        _harvest_item_avatar(item, name)
         try:
             item.click()
             page.wait_for_timeout(1000)
@@ -575,24 +778,45 @@ def _find_and_open_conversation(page, name):
 
 
 def _reopen_conversation(page, name):
-    """回会话列表再重新打开该会话：强制客户端重新拉取并渲染消息列表。
-    2026-10-20 它叫多多案例：消息服务端已送达（用户手机可见），但聊天窗 DOM
-    在 15s 校验窗口内始终未渲染新气泡——重开会话即可恢复。返回聊天窗是否就绪。"""
+    """回会话列表再重开会话（备用路径）。2026-11-16 加 Escape 关掉遮挡层。"""
     try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
         _click_sidebar_back(page)
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1000)
         if not _sidebar_panel_visible(page):
-            _open_message_center(page)
+            _open_message_center(page, budget_s=90)
         if not _sidebar_panel_visible(page):
             _log("reopen_conversation: sidebar panel still not visible")
             return False
         _find_and_open_conversation(page, name)
-        ok = _wait_chat_input(page, 6000) is not None
+        ok = _wait_chat_input(page, 4000) is not None
         _log("reopen_conversation [%s]: chat view ready=%s" % (name, ok))
         return ok
     except Exception as e:
         _log("reopen_conversation error: %r" % e)
         return False
+
+
+def _ensure_conversation_list(page):
+    """批次内切换目标：从聊天视图回到会话列表，必要时重开消息中心。
+
+    旧版每发一个人都关掉并重启整个 Chromium（10 目标 = 10 次冷启动 +
+    10 次 30s 侧栏等待），失败窗口极大。现在整轮只开一次浏览器。
+    """
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    _click_sidebar_back(page)
+    page.wait_for_timeout(400)
+    if _sidebar_panel_visible(page):
+        return
+    _open_message_center(page, budget_s=90)
+    if not _sidebar_panel_visible(page):
+        # 侧栏打不开属于页面/网络层故障，对所有目标都是必然失败：
+        # 交给调度层整轮短路，而不是给 10 个人各写一条失败记录。
+        raise InfraError("消息侧栏未能打开（会话列表不可见），稍后自动重试")
 
 
 def _goto_retry(page, url, attempts=5, **kw):
@@ -608,7 +832,8 @@ def _goto_retry(page, url, attempts=5, **kw):
             _log("goto retry %d/%d for %s: %r" % (i + 1, attempts, url[:44], e))
             if i < attempts - 1:
                 time.sleep(random.uniform(3.0, 6.0))
-    raise last
+    raise InfraError("网络不可达（连续 %d 次导航失败）: %s"
+                     % (attempts, str(last).split("\n")[0]))
 
 
 def purge_old_shots(max_age_h=24):
@@ -1309,116 +1534,75 @@ def enrich_uid(items):
     return out
 
 
-def _send_once(name, text):
-    """单次发送尝试。返回 (ok, detail)。"""
+def _send_once(page, name, text):
+    """单次发送（复用调用方已打开的 page）。返回 (ok, detail)。
+
+    2026-11-16 重写：
+    1) 先严格确认文本真的进了输入框，写不进去绝不按 Enter。旧版 filled=False
+       出现在所有目标上，等于大量「空发」被随机判成成功或失败；
+    2) 校验只看「输入框被清空」与「新增我方消息行」，废除整页固定文本计数
+       （每天内容相同，历史消息/会话预览/虚拟列表让计数随机漂移）；
+    3) InfraError 向上抛，由调度层整轮短路，不再逐个消耗目标。
+    """
     try:
-        page = _open(headless=False)
-        _open_message_center(page)
+        _ensure_conversation_list(page)
         if not has_session_cookie(_context):
-            raise NotLoggedIn("登录态已失效，请重新扫码")
-        if not _sidebar_panel_visible(page):
-            # 2026-10-19：一次没打开不再直接失败——带重载兜底再开一次
-            _log("send_once: sidebar not visible -> one more open attempt (reload ladder)")
-            _open_message_center(page)
-        if not _sidebar_panel_visible(page):
-            _shot(page, "nosidebar")
-            raise SendFailed("消息侧栏未能打开（会话列表不可见），稍后用「立即发送」重试即可")
+            raise NotLoggedIn("登录态已失效，请重新扫码登录")
         _find_and_open_conversation(page, name)
-        page.wait_for_timeout(500)
-
-        box = _wait_chat_input(page, 3000)
-        if box is None:
-            raise SendFailed("找不到聊天输入框（会话已打开但输入框未渲染）")
-        box.click()
-        page.wait_for_timeout(300)
-
-        before = _dialog_text_count(page, text)
-        if before < 0:
-            before = page.get_by_text(text).count()
-        page.keyboard.insert_text(text)
         page.wait_for_timeout(400)
-        # 输入确认：文本确实进了输入框（焦点丢失时 insert_text 会落空，
-        # 此时「输入框为空」是常态，绝不能作为发送成功的依据）
-        typed = _input_box_text(page)
-        input_filled = typed is not None and typed.strip() != ""
-        if not input_filled:
-            box.click()
-            page.wait_for_timeout(200)
-            page.keyboard.insert_text(text)
-            page.wait_for_timeout(300)
-            typed = _input_box_text(page)
-            input_filled = typed is not None and typed.strip() != ""
-            _log("send_once [%s]: refilled input after focus loss (filled=%s)" % (name, input_filled))
+
+        typed_ok, observed = _type_into_input(page, text)
+        if not typed_ok:
+            raise SendFailed("文本未能写入聊天输入框（未执行发送，避免空发）；观察到 %r" % observed)
+
+        before = _chat_bubbles(page)
         page.keyboard.press("Enter")
-        page.wait_for_timeout(600)
-        # 兜底：仅当 Enter 没发出去（输入框仍有文本）才点发送按钮。
-        # 旧版无条件点击可能误触发表情面板等弹层，其内部 contenteditable
-        # 会污染清空判定（2026-10-20 它叫多多误报复盘）。
-        if input_filled and (_input_box_text(page) or "").strip():
-            btn = _first_visible(page, SEND_BUTTON_SELECTORS, timeout=1200)
+        page.wait_for_timeout(500)
+        # 仅当 Enter 没发出去（输入框仍有文本）才点发送按钮兜底
+        cur = _read_input(page)
+        if cur is not None and cur.strip():
+            btn = _first_visible(page, SEND_BUTTON_SELECTORS, timeout=1000)
             if btn is not None:
                 try:
-                    btn.click()
+                    btn.click(force=True, timeout=2000)
                 except Exception:
                     pass
 
-        # 强校验三信号（15s + 重开后 10s）：
-        # 信号1（最强）：对话区 innerText 中该文本出现次数增加（before/after 排除同文本历史）
-        # 信号2（兜底）：发送前输入框有文本 → 发送后被清空并保持清空 = 客户端已接受发送
-        # 信号3（2026-10-20 新增）：前两者无果时回列表重开会话，强制客户端重拉消息列表——
-        #              专治「服务端已送达、本地气泡迟迟不渲染」（当天它叫多多即此，用户手机已收到）
-        # 全程记录采样（before/cnt/输入框状态），失败时随错误信息输出，不再盲猜。
-        ok = False
-        input_cleared = False
+        # 12s 校验窗口：输入框清空（客户端已接受）或新增我方消息行
         cleared_streak = 0
-        samples = ["before=%d" % before]
-        for _ in range(30):
+        bubble_seen = False
+        samples = []
+        for _ in range(24):
             page.wait_for_timeout(500)
-            cnt = _dialog_text_count(page, text)
-            if cnt < 0:
-                cnt = page.get_by_text(text).count()
-            cur = _input_box_text(page)
-            box_empty = cur is not None and cur.strip() == ""
-            if cnt > before:
-                ok = True
-                break
-            if input_filled and box_empty:
-                cleared_streak += 1
-                if cleared_streak >= 2:
-                    input_cleared = True
-                    # 不 break：气泡若随后渲染出来，报「已发送」更准确
-            else:
-                cleared_streak = 0
-            if len(samples) < 10:
-                samples.append("cnt=%d,in=%s" % (cnt, "E" if box_empty else ("F" if cur is not None else "?")))
-        if not ok and input_cleared:
-            _log("send_message -> %s OK (input cleared, bubble lag)" % name)
-            return True, "已发送（气泡校验超时，但输入框已清空，消息已进入发送队列）"
-        if not ok:
-            # 信号3：重开会话强制刷新消息列表
-            _log("send_once [%s]: signals 1/2 failed (%s) -> reopen to force refresh"
-                 % (name, "; ".join(samples[-3:])))
-            if _reopen_conversation(page, name):
-                for _ in range(20):
-                    page.wait_for_timeout(500)
-                    cnt = _dialog_text_count(page, text)
-                    if cnt < 0:
-                        cnt = page.get_by_text(text).count()
-                    if cnt > before:
-                        ok = True
-                        break
-                if ok:
-                    _log("send_message -> %s OK (confirmed after reopen)" % name)
-                    return True, "已发送（重开会话后确认到消息气泡）"
-        if not ok:
-            tail = _dialog_tail_hint(page)
-            raise SendFailed("发送后未检测到消息气泡（可能被风控或页面改版）；采样: %s"
-                             % "; ".join(samples)
-                             + ("；页面尾部内容: %s" % tail if tail else ""))
-        _log("send_message -> %s OK" % name)
-        return True, "已发送"
-    except NotLoggedIn as e:
-        return False, str(e)
+            cur = _read_input(page)
+            after = _chat_bubbles(page)
+            empty = cur is not None and cur.strip() == ""
+            cleared_streak = cleared_streak + 1 if empty else 0
+            if len(samples) < 8:
+                samples.append("in=%s,msg=%d->%d"
+                               % ("E" if empty else ("F" if cur is not None else "?"),
+                                  len(before), len(after)))
+            if _bubble_added(before, after, text):
+                bubble_seen = True
+                # 气泡 + 输入框已清空（或 DOM 重建导致状态未知）才直接判成功，
+                # 避免虚拟列表异步补载历史消息时把旧的同文消息当成刚发出的。
+                if empty or cur is None:
+                    _log("send_message -> %s OK (new bubble)" % name)
+                    return True, "已发送（确认到新消息气泡）"
+            if cleared_streak >= 2:
+                _log("send_message -> %s OK (input cleared)" % name)
+                return True, "已发送（输入框已清空，客户端已接受发送）"
+        if bubble_seen:
+            # 气泡出现过但输入框始终未确认清空：记为成功但在详情里标注待核对，
+            # 不再像旧版那样武断判失败（用户手机已收到却被记 FAIL）。
+            _log("send_message -> %s OK (bubble seen, input state unknown)" % name)
+            return True, "已发送（见到新消息气泡，输入框状态未确认，建议核对）"
+        tail = _dialog_tail_hint(page)
+        raise SendFailed("发送后 12s 内输入框未清空且未见新消息气泡；采样: %s"
+                         % "; ".join(samples)
+                         + ("；页面尾部: %s" % tail if tail else ""))
+    except InfraError:
+        raise
     except SendFailed as e:
         _log("send_message -> %s FAIL: %s" % (name, e))
         return False, str(e)
@@ -1429,12 +1613,53 @@ def _send_once(name, text):
             return False, "页面加载超时: %s" % e
         _log("send_message error: %r" % e)
         return False, "异常: %r" % e
-    finally:
+
+
+def begin_batch():
+    """整轮开始：取浏览器锁、只启动一次浏览器、一次预检网络与登录态。
+
+    预检失败抛 InfraError，调度层据此中止整轮：不写失败历史、不标记当天已跑，
+    环境恢复后自动补跑未完成的目标。修复 10-23 / 11-02 / 11-16 三次全军覆没
+    的放大机制——旧版会让 10 个目标各失败一次，最后还把当天标记为已完成。
+    """
+    _BROWSER_LOCK.acquire()
+    try:
+        page = _open(headless=False)
+        _goto_retry(page, "https://www.douyin.com/", attempts=2,
+                    wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(1200)
+        if not has_session_cookie(_context):
+            raise NotLoggedIn("登录态已失效，请重新扫码登录")
+        return page
+    except InfraError:
         _close()
+        _BROWSER_LOCK.release()
+        raise
+    except Exception as e:
+        # 预检阶段的任何异常都按基础设施故障处理，避免冒泡成普通异常
+        # 绕过调度层的短路逻辑，导致目标被逐个消耗并写入假失败。
+        _close()
+        _BROWSER_LOCK.release()
+        raise InfraError("发送前预检失败: %s" % str(e).split("\n")[0]) from e
 
 
-def send_message(name, text):
+def end_batch():
+    """整轮结束：关闭浏览器并释放锁。"""
+    _close()
+    try:
+        _BROWSER_LOCK.release()
+    except RuntimeError:
+        pass
+
+
+def send_message(name, text, page=None):
     """给 name 发送一条 text。返回 (ok, detail)。
-    失败不当场重试（2026-10-16 规则：全部跑完一遍后，失败者由「立即发送」统一补发）。"""
+    page 非空时复用批次浏览器（整轮只开一次）；为空时自行开关一次。"""
+    if page is not None:
+        return _send_once(page, name, text)
     with _BROWSER_LOCK:
-        return _send_once(name, text)
+        p = _open(headless=False)
+        try:
+            return _send_once(p, name, text)
+        finally:
+            _close()

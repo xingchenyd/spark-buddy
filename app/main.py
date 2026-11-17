@@ -203,6 +203,22 @@ def status():
         "targets_total": len(cfg.get("targets", [])),
         "next": scheduler.next_run_info(),
         "last_run_date": st.get("last_run_date", ""),
+        # 2026-11-16：把浏览器可用性与最近一次基础设施故障暴露给面板/排障
+        "browser": douyin.browser_diagnostics(),
+        "infra_error": getattr(scheduler, "last_infra_error", ""),
+        "code_version": config.CODE_VERSION,
+    }
+
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    """环境与浏览器自检（不启动浏览器，只读检查）。"""
+    return {
+        "browser": douyin.browser_diagnostics(),
+        "infra_error": getattr(scheduler, "last_infra_error", ""),
+        "code_version": config.CODE_VERSION,
+        "alive": config.load_alive(),
+        "state": config.load_state(),
     }
 
 
@@ -431,7 +447,12 @@ def send_one(body: dict):
 
     scheduler.task_running = True
     try:
-        ok, detail = douyin.send_message(name, text)
+        try:
+            ok, detail = douyin.send_message(name, text)
+        except douyin.InfraError as e:
+            # 环境级故障不算这个人的失败，也不写历史；面板给出可操作提示
+            scheduler.last_infra_error = str(e)
+            return {"ok": False, "msg": "环境未就绪，未执行发送：%s" % e}
         config.add_history({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "name": name,

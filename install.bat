@@ -35,7 +35,15 @@ if errorlevel 1 (
 )
 
 echo [3/3] Installing Chromium for Playwright (about 150 MB, one-time) ...
+rem Install into the project-private folder: the global ms-playwright cache is
+rem shared with other tools and can be upgraded/cleaned without notice, which
+rem used to break this app with "Executable doesn't exist at chromium-1194".
+set "PLAYWRIGHT_BROWSERS_PATH=%~dp0.pw-browsers"
 "%PY%" -m playwright install chromium
+if errorlevel 1 (
+    echo [WARN] Chromium download failed. The panel can still fall back to any
+    echo installed Chromium or Microsoft Edge on this machine.
+)
 
 echo.
 echo ==============================================
